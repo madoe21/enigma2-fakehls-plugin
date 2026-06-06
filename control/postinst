@@ -1,0 +1,23 @@
+#!/bin/sh
+# postinst - wird nach der Installation ausgefuehrt
+
+PLUGIN_DIR="/usr/lib/enigma2/python/Plugins/Extensions/E2HLSServer"
+
+echo "E2HLSServer: Running post-install..."
+
+# Alte Installationen entfernen (FakeHLSPlugin, StreamHLSPlugin)
+for OLD_DIR in \
+    /usr/lib/enigma2/python/Plugins/Extensions/FakeHLSPlugin \
+    /usr/lib/enigma2/python/Plugins/Extensions/StreamHLSPlugin; do
+    if [ -d "$OLD_DIR" ]; then
+        echo "E2HLSServer: Removing old installation: $OLD_DIR"
+        rm -rf "$OLD_DIR"
+    fi
+done
+
+# Python Cache loeschen
+find "$PLUGIN_DIR" -name "*.pyc" -delete 2>/dev/null || true
+find "$PLUGIN_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+echo "E2HLSServer: Post-install complete."
+exit 0

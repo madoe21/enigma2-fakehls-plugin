@@ -1,0 +1,21 @@
+@boxIp = {{$dotenv BOX_HOST}}
+@httpPort = 8080
+@serviceRef = 1:0:1:445D:453:1:C00000:0:0:0:
+@streamUser = {{$dotenv STREAM_USER}}
+@streamPass = {{$dotenv STREAM_PASS}}
+
+### 1) Plugin status
+GET http://{{boxIp}}:{{httpPort}}/status
+Accept: text/plain
+
+### 2) Render player page
+GET http://{{boxIp}}:{{httpPort}}/player?ref={{serviceRef}}&user={{streamUser}}&pass={{streamPass}}
+Accept: text/html
+
+### 3) Direct stream redirect to HLS playlist
+GET http://{{boxIp}}:{{httpPort}}/stream?ref={{serviceRef}}&user={{streamUser}}&pass={{streamPass}}
+Accept: application/vnd.apple.mpegurl
+
+### 4) Fetch server logs
+GET http://{{boxIp}}:{{httpPort}}/logs
+Accept: text/plain

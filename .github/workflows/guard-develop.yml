@@ -1,0 +1,14 @@
+name: guard-develop
+on:
+  pull_request:
+    branches: [develop]
+jobs:
+  block-master:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject merges from master
+        run: |
+          if [ "${{ github.head_ref }}" = "main" ]; then
+            echo "Merging main into develop is not allowed."
+            exit 1
+          fi

@@ -1,0 +1,93 @@
+# E2HLS Server for Enigma2 - German Translation
+# Copyright (C) 2026
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: E2HLSServer 1.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-03-07\n"
+"PO-Revision-Date: 2026-03-07\n"
+"Last-Translator: \n"
+"Language-Team: German\n"
+"Language: de\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "E2HLS Server - Stream Enigma2 channels as HLS to any device"
+msgstr "E2HLS Server - Enigma2-Sender als HLS auf beliebige Geräte streamen"
+
+msgid "Yes"
+msgstr "Ja"
+
+msgid "No"
+msgstr "Nein"
+
+msgid "Enable Plugin"
+msgstr "Plugin aktivieren"
+
+msgid "HTTP Port"
+msgstr "HTTP-Port"
+
+msgid "Enigma2 Stream Port (4 digits)"
+msgstr "Enigma2-Stream-Port (4-stellig)"
+
+msgid "Autostart on boot"
+msgstr "Autostart beim Booten"
+
+msgid "HLS Temp Directory"
+msgstr "HLS-Temp-Verzeichnis"
+
+msgid "Segment Duration (seconds)"
+msgstr "Segmentdauer (Sekunden)"
+
+msgid "Cleanup Interval (seconds)"
+msgstr "Bereinigungsintervall (Sekunden)"
+
+msgid "Inactivity Timeout (seconds)"
+msgstr "Inaktivitäts-Timeout (Sekunden)"
+
+msgid "Debug Mode"
+msgstr "Debug-Modus"
+
+msgid "Cancel"
+msgstr "Abbrechen"
+
+msgid "Save"
+msgstr "Speichern"
+
+msgid "Settings"
+msgstr "Einstellungen"
+
+msgid "Close"
+msgstr "Schließen"
+
+msgid "Restart"
+msgstr "Neustart"
+
+msgid "Kill Streams"
+msgstr "Streams beenden"
+
+msgid "Support this plugin: https://buymeacoffee.com/madoe21"
+msgstr "Dieses Plugin unterstützen: https://buymeacoffee.com/madoe21"
+
+msgid "HTTP Server"
+msgstr "HTTP-Server"
+
+msgid "Running"
+msgstr "Aktiv"
+
+msgid "Stopped"
+msgstr "Gestoppt"
+
+msgid "Address"
+msgstr "Adresse"
+
+msgid "HLS Directory"
+msgstr "HLS-Verzeichnis"
+
+msgid "Active Streams"
+msgstr "Aktive Streams"
+
+msgid "segments"
+msgstr "Segmente"

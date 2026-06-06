@@ -1,0 +1,28 @@
+name: guard-master
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only allow develop -> master
+        run: |
+          if [ "${{ github.head_ref }}" != "develop" ]; then
+            echo "PRs to main must originate from 'develop' (got '${{ github.head_ref }}')"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version must equal develop with stripped -build suffix
+        run: |
+          git fetch origin develop:refs/remotes/origin/develop
+          DEV=$(git show origin/develop:VERSION | tr -d '[:space:]')
+          HEAD=$(cat VERSION | tr -d '[:space:]')
+          EXPECTED=${DEV%-build}
+          if [ "$HEAD" != "$EXPECTED" ]; then
+            echo "master VERSION '$HEAD' must equal develop '$DEV' with '-build' stripped ('$EXPECTED')"
+            exit 1
+          fi
+          echo "Version check passed: $HEAD"

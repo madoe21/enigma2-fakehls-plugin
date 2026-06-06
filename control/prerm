@@ -1,0 +1,16 @@
+#!/bin/sh
+# prerm - wird vor der Deinstallation ausgefuehrt
+
+PLUGIN_DIR="/usr/lib/enigma2/python/Plugins/Extensions/E2HLSServer"
+
+echo "E2HLSServer: Running pre-remove..."
+
+# FFmpeg-Prozesse beenden falls aktiv
+killall ffmpeg 2>/dev/null || true
+
+# Python Cache loeschen
+find "$PLUGIN_DIR" -name "*.pyc" -delete 2>/dev/null || true
+find "$PLUGIN_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+echo "E2HLSServer: Pre-remove complete."
+exit 0

@@ -1,0 +1,16 @@
+Package: enigma2-plugin-extensions-e2hlsserver
+Version: 1.0.0
+Architecture: all
+Maintainer: madoe21 <https://github.com/madoe21>
+Homepage: https://github.com/madoe21/enigma2-hls-server
+Source: https://github.com/madoe21/enigma2-hls-server
+Section: extra
+Priority: optional
+Depends: enigma2, ffmpeg
+License: MIT
+Description: E2 HLS Server for Enigma2
+ Streams Enigma2 channels as HLS to any device (Roku, browser, VLC).
+ Supports quality profiles (copy, low, medium, high, ultra, custom).
+ Uses named pipes for zero-overhead segmentation.
+ .
+ https://github.com/madoe21/enigma2-hls-server

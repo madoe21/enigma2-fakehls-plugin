@@ -1,0 +1,46 @@
+name: bump-develop
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Compute next -build version
+        id: next
+        run: |
+          CUR=$(cat VERSION | tr -d '[:space:]')
+          BASE=${CUR%-build}
+          IFS=. read MA MI PA <<<"$BASE"
+          MI=$((MI + 1))
+          NEXT="${MA}.${MI}.0-build"
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+
+      - name: Write VERSION
+        run: echo "${{ steps.next.outputs.version }}" > VERSION
+
+      - name: Open PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/bump-${{ steps.next.outputs.version }}
+          base: develop
+          title: "chore: bump VERSION to ${{ steps.next.outputs.version }}"
+          commit-message: "chore: bump VERSION to ${{ steps.next.outputs.version }}"
+          body: |
+            Automatic post-release bump.
+
+            This PR raises the develop VERSION to the next minor `-build`
+            placeholder after a release on main.
+          add-paths: VERSION
+          delete-branch: true
