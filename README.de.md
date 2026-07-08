@@ -637,3 +637,9 @@ sind die beste Unterstützung. Danke!
 ## 27. Lizenz
 
 MIT — Copyright (c) 2026 Cyber93de. Siehe [LICENSE](LICENSE).
+
+---
+
+## Mit aiflow gebaut
+
+Dieses Projekt wurde mit Unterstützung von **[aiflow](https://cyber93de.github.io/aiflow/)** gebaut — *built with aiflow*.
