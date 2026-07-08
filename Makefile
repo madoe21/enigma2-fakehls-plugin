@@ -88,6 +88,10 @@ build: check-deps clean-build $(IPK_FILE)
 	@echo " Build complete: $(IPK_FILE)"
 	@echo "========================================="
 
+# Alias so `make ipk` works (used by the release workflow, like the other
+# plugins).
+ipk: build
+
 $(IPK_FILE): $(IPK_STAGE)
 	@echo "Building IPK: $(IPK_FILE)..."
 	@cd $(IPK_STAGE) && \
