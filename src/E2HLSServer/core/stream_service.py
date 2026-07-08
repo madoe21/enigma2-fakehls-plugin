@@ -8,17 +8,25 @@ import time
 
 from .ffmpeg_service import build_stream_url, start_ffmpeg
 
+QUALITY_PRESETS = {
+    "hw_transcode": {"label": "Hardware-Transcode (Port 8002)", "seg_duration": 2},
+    "low_latency":  {"label": "Niedrige Latenz (1s)",           "seg_duration": 1},
+    "balanced":     {"label": "Ausgewogen (2s)",                 "seg_duration": 2},
+    "stable":       {"label": "Stabil (4s)",                     "seg_duration": 4},
+}
+
 
 class Segmenter(threading.Thread):
     PIPE_READ_SIZE = 65536
 
-    def __init__(self, stream_id, settings, logger, local_ip_provider):
+    def __init__(self, stream_id, settings, logger, local_ip_provider, seg_duration=None):
         threading.Thread.__init__(self)
         self.stream_id = stream_id
         self.settings = settings
         self.logger = logger
         self.local_ip_provider = local_ip_provider
         self.daemon = True
+        self._seg_duration = seg_duration if seg_duration is not None else settings.segment_duration()
 
         self._stop_event = threading.Event()
         self.segment_index = 0
@@ -84,7 +92,7 @@ class Segmenter(threading.Thread):
 
                 buffer_data.extend(chunk)
                 now = time.time()
-                if now - segment_start >= self.settings.segment_duration():
+                if now - segment_start >= self._seg_duration:
                     if buffer_data:
                         self._write_segment(bytes(buffer_data))
                         buffer_data = bytearray()
@@ -127,11 +135,11 @@ class Segmenter(threading.Thread):
 
             content = "#EXTM3U\n"
             content += "#EXT-X-VERSION:3\n"
-            content += "#EXT-X-TARGETDURATION:" + str(self.settings.segment_duration() + 1) + "\n"
+            content += "#EXT-X-TARGETDURATION:" + str(self._seg_duration + 1) + "\n"
             content += "#EXT-X-MEDIA-SEQUENCE:" + str(first_seq) + "\n"
 
             for idx, _seg_path, _created_at in active:
-                content += "#EXTINF:" + str(float(self.settings.segment_duration())) + ",\n"
+                content += "#EXTINF:" + str(float(self._seg_duration)) + ",\n"
                 content += self.segment_url(idx) + "\n"
 
             tmp_path = self.playlist + ".tmp"
@@ -215,13 +223,32 @@ class StreamService(object):
         for stream_id in to_delete:
             self.streams.pop(stream_id, None)
 
+    def _read_e2_credentials(self):
+        try:
+            from ..platform.enigma2.config import read_e2_credentials
+            return read_e2_credentials()
+        except Exception:
+            return "root", ""
+
     def generate_stream_id(self, params):
-        base = params["ref"] + ":" + str(self.settings.stream_port())
+        quality = params.get("quality", "balanced")
+        base = params["ref"] + ":" + str(self.settings.stream_port()) + ":" + quality
         if params.get("user"):
             base += ":" + params["user"]
         return hashlib.md5(base.encode()).hexdigest()[:8]
 
     def get_or_create_stream(self, params):
+        quality = params.get("quality", "balanced")
+        preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["balanced"])
+        hw = (quality == "hw_transcode")
+
+        effective_params = dict(params)
+        if hw:
+            effective_params["hw"] = True
+            e2_user, e2_pass = self._read_e2_credentials()
+            effective_params["e2_user"] = e2_user
+            effective_params["e2_pass"] = e2_pass
+
         stream_id = self.generate_stream_id(params)
 
         if stream_id in self.streams:
@@ -231,17 +258,18 @@ class StreamService(object):
             self.logger.log_stream_active(stream_id, info)
             return stream_id, False
 
-        self.logger.log_stream_start(stream_id, params, self.settings.stream_port())
+        self.logger.log_stream_start(stream_id, effective_params, self.settings.stream_port())
         self._cleanup_stream_files(stream_id)
 
         hls_dir = self.settings.hls_dir()
         log_dir = os.path.join(hls_dir, "logs")
         self.ensure_hls_dir(hls_dir)
 
-        segmenter = Segmenter(stream_id, self.settings, self.logger, self.local_ip_provider)
+        segmenter = Segmenter(stream_id, self.settings, self.logger, self.local_ip_provider,
+                              seg_duration=preset["seg_duration"])
         segmenter.create_pipe()
 
-        stream_url = build_stream_url(params, self.settings)
+        stream_url = build_stream_url(effective_params, self.settings)
         process = start_ffmpeg(
             stream_url,
             segmenter.pipe_path,
@@ -249,6 +277,8 @@ class StreamService(object):
             log_dir,
             self.settings,
             on_exit=self._on_ffmpeg_exit,
+            e2_user=effective_params.get("e2_user"),
+            e2_pass=effective_params.get("e2_pass"),
         )
 
         if process is None:

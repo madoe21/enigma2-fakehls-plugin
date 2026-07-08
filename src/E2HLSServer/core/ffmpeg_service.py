@@ -9,6 +9,12 @@ import urllib.parse
 
 def build_stream_url(params, settings):
     ref = params.get("ref", "")
+    hw = params.get("hw", False)
+
+    if hw:
+        port = str(settings.stream_hw_port())
+        return "http://127.0.0.1:" + port + "/" + ref
+
     port = str(settings.stream_port())
     user = params.get("user")
     password = params.get("password")
@@ -21,12 +27,13 @@ def build_stream_url(params, settings):
     return "http://127.0.0.1:" + port + "/" + ref
 
 
-def build_ffmpeg_cmd(stream_url, output_pipe, settings):
+def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=None):
+    import base64
     cmd = [
         settings.ffmpeg_bin(),
         "-hide_banner",
         "-loglevel",
-        "info",
+        "warning",
         "-reconnect",
         "1",
         "-reconnect_streamed",
@@ -35,6 +42,11 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings):
         "5",
         "-timeout",
         "30000000",
+    ]
+    if e2_user and e2_pass:
+        creds = base64.b64encode((e2_user + ":" + e2_pass).encode()).decode()
+        cmd += ["-headers", "Authorization: Basic " + creds + "\r\n"]
+    cmd += [
         "-i",
         stream_url,
         "-map",
@@ -55,9 +67,9 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings):
     return cmd
 
 
-def start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings, on_exit=None):
+def start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings, on_exit=None, e2_user=None, e2_pass=None):
     ffmpeg_log = os.path.join(log_dir, stream_id + "_ffmpeg.log")
-    cmd = build_ffmpeg_cmd(stream_url, output_pipe, settings)
+    cmd = build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=e2_user, e2_pass=e2_pass)
 
     try:
         with open(ffmpeg_log, "w", encoding="utf-8") as log_handle:

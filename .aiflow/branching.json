@@ -1,0 +1,60 @@
+{
+  "model": "simple",
+  "strict": true,
+  "permanentBranches": [
+    "main",
+    "develop"
+  ],
+  "branchTypes": [
+    "chore/*"
+  ],
+  "allowedCreations": [
+    {
+      "type": "<any temporary>",
+      "from": [
+        "develop"
+      ]
+    },
+    {
+      "type": "chore/*",
+      "from": [
+        "develop",
+        "main"
+      ]
+    }
+  ],
+  "allowedMerges": [
+    {
+      "from": "develop",
+      "to": "main"
+    },
+    {
+      "from": "main",
+      "to": "develop"
+    },
+    {
+      "from": "chore/*",
+      "to": "develop"
+    },
+    {
+      "from": "chore/*",
+      "to": "main"
+    }
+  ],
+  "pullRequests": {
+    "required": true,
+    "protectedBranches": [
+      "main",
+      "develop"
+    ],
+    "rules": [
+      "no direct push to protected branches",
+      "merge only via Pull Request",
+      "PR must pass validation"
+    ]
+  },
+  "release": {
+    "auto": false
+  },
+  "branchNaming": "not enforced (temporary branches may use any name)"
+}

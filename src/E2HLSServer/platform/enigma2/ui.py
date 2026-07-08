@@ -56,6 +56,7 @@ class E2HlsServerConfigScreen(ConfigListScreen, Screen):
         self.list.append(getConfigListEntry(_("Enable Plugin"), config.plugins.e2hlsserver.enabled))
         self.list.append(getConfigListEntry(_("HTTP Port"), config.plugins.e2hlsserver.port))
         self.list.append(getConfigListEntry(_("Enigma2 Stream Port (4 digits)"), config.plugins.e2hlsserver.stream_port))
+        self.list.append(getConfigListEntry(_("Enigma2 HW Transcode Port"), config.plugins.e2hlsserver.stream_hw_port))
         self.list.append(getConfigListEntry(_("Autostart on boot"), config.plugins.e2hlsserver.autostart))
         self.list.append(getConfigListEntry(_("HLS Temp Directory"), config.plugins.e2hlsserver.hls_dir))
         self.list.append(getConfigListEntry(_("Segment Duration (seconds)"), config.plugins.e2hlsserver.segment_duration))

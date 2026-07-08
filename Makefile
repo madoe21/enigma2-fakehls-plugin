@@ -11,6 +11,7 @@ ARCHITECTURE   := all
 BOX_HOST       := 192.168.1.4
 BOX_USER       := root
 BOX_PORT       := 22
+-include .env
 BOX_SSH        := ssh -p $(BOX_PORT) $(BOX_USER)@$(BOX_HOST)
 BOX_SCP        := scp -P $(BOX_PORT)
 
