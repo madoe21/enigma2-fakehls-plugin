@@ -13,13 +13,22 @@ Enigma2 plugin that streams live TV channels as HLS to any device (Roku, browser
 
 ## URL Format
 
-```
-# Web player (browser)
-http://<box-ip>:8080/player?ref=<service-ref>&user=<user>&pass=<pass>
+The server listens on port **8003** by default (configurable in the plugin
+settings). Streaming mirrors the OpenWebInterface URL shape — just HLS on this
+port:
 
-# Direct HLS (Roku, VLC)
-http://<box-ip>:8080/stream?ref=<service-ref>&user=<user>&pass=<pass>
 ```
+# Direct HLS, OpenWebInterface style (Roku, VLC): service ref straight in the path
+http://<box-ip>:8003/<service-ref>
+
+# Web player (browser)
+http://<box-ip>:8003/player?ref=<service-ref>&user=<user>&pass=<pass>
+
+# Legacy query form (still supported)
+http://<box-ip>:8003/stream?ref=<service-ref>&user=<user>&pass=<pass>
+```
+
+Example: `http://192.168.1.10:8003/1:0:19:283D:3FB:1:C00000:0:0:0:`
 
 Special characters in password must be URL-encoded: `&` → `%26`, `$` → `%24`
 

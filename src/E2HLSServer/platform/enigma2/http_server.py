@@ -1,13 +1,240 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 
+import base64
+import json
 import os
+import re
 import urllib.parse
+import urllib.request
 
 from twisted.web.resource import Resource
 from twisted.web.server import Site
 
 from .config import HTML_TEMPLATE_FILE, get_favicon_path
+
+_WEB_HTML = r"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>E2HLS</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0d0d0d; color: #f0f0f0; font-family: sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+#bouquet-bar { display: none; gap: 0.4rem; padding: 0.5rem 1rem; background: #111; border-bottom: 1px solid #2a2a2a; flex-shrink: 0; flex-wrap: wrap; align-items: center; }
+#bouquet-bar span { font-size: 0.8rem; color: #555; margin-right: 0.3rem; }
+.bq-btn { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 3px; color: #aaa; padding: 0.3rem 0.8rem; font-size: 0.85rem; cursor: pointer; }
+.bq-btn:hover { border-color: #00cc88; color: #00cc88; }
+.bq-btn.active { background: #003322; border-color: #00cc88; color: #00cc88; }
+#main { flex: 1; display: flex; overflow: hidden; }
+#list { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid #2a2a2a; background: #111; overflow: hidden; transition: width 0.25s ease, opacity 0.25s ease; }
+#list.hidden { width: 0; opacity: 0; border-right: none; pointer-events: none; }
+#search { background: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a; padding: 0.7rem 1rem; color: #f0f0f0; font-size: 0.9rem; outline: none; flex-shrink: 0; width: 100%; }
+#channels { flex: 1; overflow-y: auto; }
+.ch { padding: 0.65rem 1rem; cursor: pointer; border-bottom: 1px solid #1a1a1a; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ch:hover { background: #1e1e1e; }
+.ch.active { background: #003322; color: #00cc88; border-left: 3px solid #00cc88; padding-left: calc(1rem - 3px); }
+#right { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+#video-area { flex: 1; background: #000; display: flex; align-items: center; justify-content: center; position: relative; }
+video { width: 100%; height: 100%; display: block; }
+#placeholder { color: #444; font-size: 1rem; text-align: center; line-height: 2.2; }
+#toggle-list { position: absolute; top: 50%; left: 0; transform: translateY(-50%); z-index: 10; background: rgba(0,0,0,0.7); border: 1px solid #333; border-left: none; border-radius: 0 6px 6px 0; color: #aaa; font-size: 1.1rem; width: 22px; height: 56px; cursor: pointer; display: flex; align-items: center; justify-content: center; user-select: none; }
+#toggle-list:hover { background: rgba(0,204,136,0.2); color: #00cc88; }
+#now { position: absolute; top: 0.8rem; left: 0.8rem; background: rgba(0,0,0,0.75); border: 1px solid #00cc88; border-radius: 3px; padding: 0.3rem 0.7rem; font-size: 0.85rem; color: #00cc88; display: none; }
+#loading { position: absolute; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; flex-direction: column; gap: 1rem; }
+#loading.show { display: flex; }
+.spinner { width: 40px; height: 40px; border: 3px solid rgba(0,204,136,0.2); border-top-color: #00cc88; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#msg { position: absolute; bottom: 0.8rem; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.75); border-radius: 3px; padding: 0.3rem 0.8rem; font-size: 0.85rem; color: #aaa; display: none; white-space: nowrap; }
+#msg.show { display: block; }
+#url-bar { flex-shrink: 0; display: none; align-items: center; gap: 0.5rem; padding: 0.4rem 1rem; background: #0d0d0d; border-top: 1px solid #1e1e1e; font-size: 0.8rem; }
+#url-bar span { color: #444; white-space: nowrap; }
+#url-text { flex: 1; background: #111; border: 1px solid #222; border-radius: 3px; padding: 0.3rem 0.6rem; color: #555; font-family: monospace; font-size: 0.78rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: text; user-select: all; }
+#url-text:hover { color: #888; border-color: #333; }
+#copy-btn { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 3px; color: #555; font-size: 0.78rem; padding: 0.3rem 0.7rem; cursor: pointer; }
+#copy-btn:hover { color: #00cc88; border-color: #00cc88; }
+</style>
+</head>
+<body>
+<div id="top-bar" style="display:flex;gap:0.5rem;padding:0.5rem 1rem;background:#1a1a1a;border-bottom:1px solid #2a2a2a;flex-shrink:0;align-items:center;">
+  <span style="font-size:0.8rem;color:#555;">Qualit&auml;t:</span>
+  <select id="quality-select" onchange="onQualityChange()" style="background:#0d0d0d;border:1px solid #333;border-radius:4px;padding:0.4rem 0.7rem;color:#f0f0f0;font-size:0.85rem;outline:none;cursor:pointer;">
+    <option value="hw_transcode">Hardware-Transcode (H.264)</option>
+    <option value="low_latency">Original Niedrige Latenz (1s)</option>
+    <option value="balanced" selected>Original Ausgewogen (2s)</option>
+    <option value="stable">Original Stabil (4s)</option>
+  </select>
+</div>
+<div id="bouquet-bar"><span>Bouquet:</span></div>
+<div id="main">
+  <div id="list">
+    <input id="search" type="text" placeholder="Sender suchen&#8230;" oninput="filterChannels(this.value)" />
+    <div id="channels"></div>
+  </div>
+  <div id="right">
+    <div id="video-area">
+      <button id="toggle-list" onclick="toggleList()">&#9664;</button>
+      <div id="placeholder">Lade Senderliste&#8230;</div>
+      <video id="v" controls autoplay style="display:none"></video>
+      <div id="now"></div>
+      <div id="loading"><div class="spinner"></div><span style="color:#aaa;font-size:0.9rem">Starte Stream&#8230;</span></div>
+      <div id="msg"></div>
+    </div>
+    <div id="url-bar">
+      <span>HLS-URL:</span>
+      <div id="url-text"></div>
+      <button id="copy-btn" onclick="copyUrl()">Kopieren</button>
+    </div>
+  </div>
+</div>
+<script>
+let all = [], filtered = [], cur = -1, listVisible = true, hls = null;
+
+function onQualityChange() { if (cur >= 0) play(cur); }
+
+function toggleList() {
+  listVisible = !listVisible;
+  document.getElementById('list').classList.toggle('hidden', !listVisible);
+  document.getElementById('toggle-list').innerHTML = listVisible ? '&#9664;' : '&#9654;';
+}
+
+async function loadBouquets() {
+  try {
+    const r = await fetch('/api/bouquets');
+    const bqs = await r.json();
+    if (!bqs.length) { setPlaceholder('Keine Bouquets'); return; }
+    renderBouquets(bqs);
+    loadChannels(bqs[0].ref);
+  } catch(e) { setPlaceholder('Fehler: ' + e.message); }
+}
+
+function renderBouquets(bqs) {
+  const bar = document.getElementById('bouquet-bar');
+  while (bar.children.length > 1) bar.removeChild(bar.lastChild);
+  bqs.forEach((bq, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'bq-btn' + (i === 0 ? ' active' : '');
+    btn.textContent = bq.name;
+    btn.onclick = () => {
+      document.querySelectorAll('.bq-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      loadChannels(bq.ref);
+    };
+    bar.appendChild(btn);
+  });
+  bar.style.display = 'flex';
+}
+
+async function loadChannels(ref) {
+  try {
+    const r = await fetch('/api/channels?ref=' + encodeURIComponent(ref));
+    const chs = await r.json();
+    if (!chs.length) { setPlaceholder('Keine Sender'); return; }
+    all = chs; filtered = [...chs]; cur = -1;
+    document.getElementById('search').value = '';
+    renderList();
+    setPlaceholder(filtered.length + ' Sender — Antippen zum Starten');
+  } catch(e) { showMsg('Fehler: ' + e.message); }
+}
+
+function renderList() {
+  const div = document.getElementById('channels');
+  div.innerHTML = '';
+  filtered.forEach((ch, i) => {
+    const el = document.createElement('div');
+    el.className = 'ch' + (i === cur ? ' active' : '');
+    el.textContent = (i+1) + '. ' + ch.name;
+    el.onclick = () => play(i);
+    div.appendChild(el);
+  });
+}
+
+function filterChannels(q) {
+  q = q.toLowerCase();
+  filtered = q ? all.filter(c => c.name.toLowerCase().includes(q)) : [...all];
+  cur = -1; renderList();
+}
+
+async function play(i) {
+  cur = i;
+  const ch = filtered[i];
+  const v = document.getElementById('v');
+  document.getElementById('placeholder').style.display = 'none';
+  document.getElementById('loading').classList.add('show');
+  v.style.display = 'block';
+  if (hls) { hls.destroy(); hls = null; }
+  v.pause(); v.removeAttribute('src'); v.load();
+  try {
+    const quality = document.getElementById('quality-select').value;
+    const r = await fetch('/api/start?ref=' + encodeURIComponent(ch.ref) + '&quality=' + quality);
+    if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
+    const data = await r.json();
+    const hlsUrl = '/hls/' + data.playlist;
+    document.getElementById('url-bar').style.display = 'flex';
+    document.getElementById('url-text').textContent = window.location.origin + hlsUrl;
+    if (Hls.isSupported()) {
+      hls = new Hls({
+        liveSyncDurationCount: 2,
+        liveMaxLatencyDurationCount: 5,
+        manifestLoadingMaxRetry: 10,
+        manifestLoadingRetryDelay: 500,
+        fragLoadingMaxRetry: 10,
+        levelLoadingMaxRetry: 10,
+        liveSyncOnStallEnabled: true,
+        maxLiveSyncPlaybackRate: 1.5,
+      });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(v);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        document.getElementById('loading').classList.remove('show');
+        v.play().catch(()=>{});
+      });
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        if (d.fatal) {
+          document.getElementById('loading').classList.remove('show');
+          showMsg('Stream-Fehler: ' + d.type);
+        }
+      });
+    } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+      v.src = hlsUrl;
+      v.oncanplay = () => { document.getElementById('loading').classList.remove('show'); v.play().catch(()=>{}); };
+    }
+  } catch(e) {
+    document.getElementById('loading').classList.remove('show');
+    showMsg('Fehler: ' + e.message);
+  }
+  document.getElementById('now').style.display = 'block';
+  document.getElementById('now').textContent = ch.name;
+  document.title = ch.name + ' — E2HLS';
+  renderList();
+  document.querySelectorAll('.ch')[i]?.scrollIntoView({block:'nearest'});
+}
+
+function copyUrl() {
+  navigator.clipboard.writeText(document.getElementById('url-text').textContent)
+    .then(() => { const b = document.getElementById('copy-btn'); b.textContent='✓'; setTimeout(()=>b.textContent='Kopieren',2000); });
+}
+function showMsg(t, ms=3000) {
+  const el = document.getElementById('msg');
+  el.textContent = t; el.classList.add('show');
+  if (ms) setTimeout(() => el.classList.remove('show'), ms);
+}
+function setPlaceholder(t) {
+  const el = document.getElementById('placeholder');
+  el.style.display = 'block'; el.textContent = t;
+}
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'ArrowDown') play(Math.min(cur+1, filtered.length-1));
+  if (e.key === 'ArrowUp')   play(Math.max(cur-1, 0));
+  if (e.key === 'Escape' || e.key === 'Tab') toggleList();
+});
+window.addEventListener('load', loadBouquets);
+</script>
+</body>
+</html>"""
 
 
 def load_html_template():
@@ -37,6 +264,8 @@ class HlsRoot(Resource):
     def render_GET(self, request):
         path = request.path.decode()
 
+        if path == "/" or path == "/web" or path == "/web/":
+            return self.render_web(request)
         if path == "/player":
             return self.render_player(request)
         if path == "/favicon.ico" or path == "/res/favicon.png":
@@ -49,6 +278,20 @@ class HlsRoot(Resource):
             return self.render_status(request)
         if path == "/logs":
             return self.render_logs(request)
+        if path == "/debug/bouquets":
+            return self.render_debug_bouquets(request)
+        if path == "/api/bouquets":
+            return self.render_api_bouquets(request)
+        if path == "/api/channels":
+            return self.render_api_channels(request)
+        if path == "/api/start":
+            return self.render_api_start(request)
+
+        # OpenWebInterface-style streaming: http://<box-ip>:<port>/<service-ref>
+        # (same URL shape as the STB streaming port, just HLS on this port).
+        ref_path = path[1:]
+        if re.match(r"^\d+:\d", ref_path):
+            return self.render_root_stream(request, urllib.parse.unquote(ref_path))
 
         request.setResponseCode(404)
         return b"Not Found"
@@ -166,6 +409,40 @@ class HlsRoot(Resource):
         request.redirect(("/hls/live_" + stream_id + ".m3u8").encode())
         return b""
 
+    def render_root_stream(self, request, ref):
+        """Stream a service given directly in the path (OpenWebInterface style).
+
+        http://<box-ip>:<port>/<service-ref> starts (or reuses) the HLS stream
+        for that reference and redirects to its playlist — mirroring the STB
+        streaming port's URL shape on this port. Credentials may come as
+        ?user=&pass= or a Basic auth header.
+        """
+        header_user, header_pass = self._parse_basic_auth(request)
+        args = request.args
+        q_user = args.get(b"user", [None])[0]
+        q_pass = args.get(b"pass", [None])[0]
+        params = {
+            "ref": ref,
+            "user": urllib.parse.unquote(q_user.decode()) if q_user else header_user,
+            "password": urllib.parse.unquote(q_pass.decode()) if q_pass else header_pass,
+        }
+
+        stream_id, _is_new = self.stream_service.get_or_create_stream(params)
+        if stream_id is None:
+            request.setResponseCode(500)
+            return b"Failed to start stream"
+
+        import time
+
+        playlist = os.path.join(self.settings.hls_dir(), "live_" + stream_id + ".m3u8")
+        for _ in range(20):
+            if os.path.exists(playlist):
+                break
+            time.sleep(0.5)
+
+        request.redirect(("/hls/live_" + stream_id + ".m3u8").encode())
+        return b""
+
     def render_hls(self, request):
         path = request.path.decode()
         filename = path.split("/")[-1]
@@ -232,6 +509,355 @@ class HlsRoot(Resource):
             return b"No logs available"
         except Exception as exc:
             return ("Error reading logs: " + str(exc)).encode()
+
+    def render_debug_bouquets(self, request):
+        bouquet_dir = "/etc/enigma2"
+        lines = ["=== Bouquet Debug ===\n"]
+        try:
+            files = sorted(os.listdir(bouquet_dir))
+            lines.append("Files in %s:\n" % bouquet_dir)
+            for f in files:
+                if "bouquet" in f.lower():
+                    lines.append("  " + f + "\n")
+            lines.append("\n")
+        except Exception as exc:
+            lines.append("Cannot list dir: " + str(exc) + "\n\n")
+
+        top = os.path.join(bouquet_dir, "bouquets.tv")
+        if os.path.exists(top):
+            lines.append("=== bouquets.tv content ===\n")
+            try:
+                with open(top, "r", encoding="utf-8", errors="ignore") as handle:
+                    lines.append(handle.read())
+            except Exception as exc:
+                lines.append("Read error: " + str(exc))
+        else:
+            lines.append("bouquets.tv NOT FOUND\n")
+
+        lines.append("\n\n=== Parsed result ===\n")
+        sub_bouquets = self._parse_top_bouquet_file(top) if os.path.exists(top) else []
+        if not sub_bouquets:
+            lines.append("_parse_top_bouquet_file returned EMPTY LIST\n")
+        for name, filename in sub_bouquets:
+            sub_path = os.path.join(bouquet_dir, filename)
+            exists = os.path.exists(sub_path)
+            try:
+                channels = self._parse_channel_file(sub_path) if exists else []
+            except Exception as exc:
+                channels = []
+                lines.append("Error parsing %s: %s\n" % (filename, exc))
+            lines.append("  [%s] %s -> %d channels (file %s)\n" % (
+                "OK" if exists else "MISSING", name, len(channels), filename))
+
+        request.setHeader(b"Content-Type", b"text/plain; charset=utf-8")
+        return "".join(lines).encode("utf-8")
+
+    def _e2_api_get(self, path):
+        url = "http://localhost:80" + path
+        req = urllib.request.Request(url, headers={"User-Agent": "E2HLSServer"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _json_response(self, request, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        request.setResponseCode(status)
+        request.setHeader(b"Content-Type", b"application/json; charset=utf-8")
+        request.setHeader(b"Access-Control-Allow-Origin", b"*")
+        return body
+
+    def render_api_bouquets(self, request):
+        try:
+            data = self._e2_api_get("/api/getservices")
+            bouquets = [
+                {"name": s["servicename"], "ref": s["servicereference"]}
+                for s in data.get("services", [])
+            ]
+            return self._json_response(request, bouquets)
+        except Exception as exc:
+            self.logger.error("API bouquets error: " + str(exc))
+            return self._json_response(request, {"error": str(exc)}, 500)
+
+    def render_api_channels(self, request):
+        ref_raw = request.args.get(b"ref", [None])[0]
+        if not ref_raw:
+            return self._json_response(request, {"error": "Missing ref"}, 400)
+        ref = urllib.parse.unquote(ref_raw.decode())
+        try:
+            encoded = urllib.parse.quote(ref, safe="")
+            data = self._e2_api_get("/api/getservices?sRef=" + encoded)
+            channels = []
+            for s in data.get("services", []):
+                r = s.get("servicereference", "")
+                if r and not r.startswith("1:64:") and "::" not in r:
+                    channels.append({"name": s.get("servicename", "Unknown"), "ref": r})
+            return self._json_response(request, channels)
+        except Exception as exc:
+            self.logger.error("API channels error: " + str(exc))
+            return self._json_response(request, {"error": str(exc)}, 500)
+
+    def render_api_start(self, request):
+        ref_raw = request.args.get(b"ref", [None])[0]
+        quality_raw = request.args.get(b"quality", [b"balanced"])[0]
+        if not ref_raw:
+            request.setResponseCode(400)
+            return b"Missing ref"
+        ref = urllib.parse.unquote(ref_raw.decode())
+        quality = quality_raw.decode() if quality_raw else "balanced"
+        from ...core.stream_service import QUALITY_PRESETS
+        if quality not in QUALITY_PRESETS:
+            quality = "balanced"
+        params = {"ref": ref, "quality": quality}
+        stream_id, _is_new = self.stream_service.get_or_create_stream(params)
+        if stream_id is None:
+            return self._json_response(request, {"error": "Failed to start stream"}, 500)
+        return self._json_response(request, {
+            "id": stream_id,
+            "playlist": "live_" + stream_id + ".m3u8",
+        })
+
+    def render_web(self, request):
+        request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
+        self.logger.log_request("GET", "/web", request.getClientIP(), 200)
+        return _WEB_HTML.encode("utf-8")
+
+    def _load_bouquets(self):
+        bouquets = []
+        errors = []
+        bouquet_dir = "/etc/enigma2"
+        top_file = os.path.join(bouquet_dir, "bouquets.tv")
+
+        try:
+            if not os.path.exists(top_file):
+                errors.append("bouquets.tv nicht gefunden in " + bouquet_dir)
+                return bouquets, errors
+
+            sub_bouquets = self._parse_top_bouquet_file(top_file)
+
+            for name, filename in sub_bouquets:
+                sub_path = os.path.join(bouquet_dir, filename)
+                try:
+                    channels = self._parse_channel_file(sub_path)
+                    if channels:
+                        bouquets.append({"name": name, "services": channels, "file": filename})
+                except Exception as exc:
+                    errors.append("Fehler beim Lesen von %s: %s" % (filename, exc))
+        except Exception as exc:
+            errors.append("Fehler beim Laden der Bouquets: " + str(exc))
+
+        return bouquets, errors
+
+    def _parse_top_bouquet_file(self, path):
+        import re
+        # collect (ref, description_or_None) pairs
+        entries = []
+        current_ref = None
+
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            for raw in handle:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith("#SERVICE "):
+                    if current_ref is not None:
+                        entries.append((current_ref, None))
+                    current_ref = line[9:].strip()
+                elif line.startswith("#DESCRIPTION ") and current_ref is not None:
+                    entries.append((current_ref, line[13:].strip() or None))
+                    current_ref = None
+
+        if current_ref is not None:
+            entries.append((current_ref, None))
+
+        result = []
+        for ref, desc in entries:
+            match = re.search(r'FROM BOUQUET "([^"]+)"', ref)
+            if match:
+                filename = match.group(1)
+                # fall back to sub-file NAME or filename if no description
+                name = desc or self._read_bouquet_name(os.path.join(os.path.dirname(path), filename)) or filename
+                result.append((name, filename))
+
+        return result
+
+    def _read_bouquet_name(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                for raw in handle:
+                    line = raw.rstrip("\r\n")
+                    if line.startswith("#NAME "):
+                        return line[6:].strip() or None
+        except Exception:
+            pass
+        return None
+
+    def _parse_channel_file(self, path):
+        channels = []
+        current_service = None
+
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            for raw in handle:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith("#SERVICE "):
+                    service_ref = line[9:].strip()
+                    parts = service_ref.split(":")
+                    # skip sub-bouquet refs (type 7) and marker entries (type 64)
+                    if len(parts) >= 2 and parts[1] in ("7", "64"):
+                        current_service = None
+                        continue
+                    current_service = {"ref": service_ref, "name": ""}
+                    channels.append(current_service)
+                elif line.startswith("#DESCRIPTION ") and current_service is not None:
+                    description = line[13:].strip()
+                    if description:
+                        current_service["name"] = description
+
+        # drop entries without a readable name
+        return [ch for ch in channels if ch["name"]]
+
+    def _build_web_html(self, bouquets, errors):
+        html_parts = ["""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E2HLS &mdash; TV Bouquets</title>
+<link rel="icon" type="image/png" href="/res/favicon.png">
+<style>
+:root{--bg:#0d0d12;--surface:#16161e;--surface2:#1e1e28;--border:#28283a;--text:#ddddf0;--dim:#7070a0;--accent:#6c8fff;--accent-h:#9ab0ff;--green:#4ade80}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:15px;line-height:1.5;min-height:100vh}
+a{color:inherit;text-decoration:none}
+
+/* header */
+.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:50}
+.hdr img{width:28px;height:28px;border-radius:6px}
+.hdr-title{font-size:17px;font-weight:700;letter-spacing:-.2px}
+.hdr-sub{margin-left:auto;font-size:12px;color:var(--dim);background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:3px 12px}
+
+/* main */
+main{max-width:860px;margin:0 auto;padding:24px 16px 48px}
+
+/* search */
+.search{position:relative;margin-bottom:20px}
+.search input{width:100%;padding:11px 16px 11px 42px;background:var(--surface);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:15px;outline:none;transition:border-color .15s}
+.search input::placeholder{color:var(--dim)}
+.search input:focus{border-color:var(--accent)}
+.search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:16px;pointer-events:none}
+
+/* bouquet card */
+.bq{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:10px;overflow:hidden;transition:border-color .15s}
+.bq.open{border-color:#3a3a5a}
+.bq-hdr{display:flex;align-items:center;padding:14px 18px;cursor:pointer;gap:12px;user-select:none;transition:background .12s}
+.bq-hdr:hover{background:var(--surface2)}
+.bq-arrow{color:var(--dim);font-size:11px;transition:transform .2s;flex-shrink:0}
+.bq.open .bq-arrow{transform:rotate(90deg)}
+.bq-name{font-weight:600;font-size:15px;flex:1}
+.bq-badge{background:var(--surface2);color:var(--dim);border:1px solid var(--border);border-radius:20px;padding:2px 10px;font-size:12px;font-variant-numeric:tabular-nums}
+
+/* channel list */
+.ch-list{display:none;border-top:1px solid var(--border)}
+.bq.open .ch-list{display:block}
+.ch{display:flex;align-items:center;padding:10px 18px 10px 46px;gap:10px;border-bottom:1px solid var(--border);transition:background .1s}
+.ch:last-child{border-bottom:none}
+.ch:hover{background:var(--surface2)}
+.ch-dot{width:6px;height:6px;border-radius:50%;background:var(--border);flex-shrink:0;transition:background .1s}
+.ch:hover .ch-dot{background:var(--accent)}
+.ch-name{flex:1;color:var(--text);transition:color .1s}
+.ch:hover .ch-name{color:var(--accent-h)}
+.ch-play{color:var(--accent);font-size:12px;opacity:0;transition:opacity .1s}
+.ch:hover .ch-play{opacity:1}
+
+/* empty / error */
+.ch-empty{padding:12px 18px 12px 46px;color:var(--dim);font-size:13px}
+.err-box{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);color:#f87171;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px}
+.no-data{text-align:center;padding:60px 20px;color:var(--dim)}
+.no-data svg{opacity:.3;margin-bottom:12px}
+
+/* footer */
+footer{text-align:center;color:var(--dim);font-size:12px;padding:20px;border-top:1px solid var(--border);margin-top:40px}
+</style>
+</head>
+<body>
+<header class="hdr">
+  <img src="/res/favicon.png" alt="E2HLS">
+  <span class="hdr-title">E2HLS Server</span>
+  <span class="hdr-sub">TV Bouquets</span>
+</header>
+<main>"""]
+
+        if errors:
+            err_lines = "<br>".join(e.replace("<", "&lt;") for e in errors)
+            html_parts.append('<div class="err-box"><strong>Fehler:</strong><br>%s</div>' % err_lines)
+
+        # search box
+        html_parts.append("""<div class="search">
+  <span class="search-icon">&#128269;</span>
+  <input type="search" id="q" placeholder="Sender suchen&hellip;" autocomplete="off" spellcheck="false">
+</div>
+<div id="list">""")
+
+        if not bouquets:
+            html_parts.append("""<div class="no-data">
+  <div style="font-size:48px;opacity:.2">&#128250;</div>
+  <div>Keine TV-Bouquets gefunden.</div>
+  <div style="font-size:13px;margin-top:6px">Prüfe ob <code>/etc/enigma2/bouquets.tv</code> vorhanden ist.</div>
+</div>""")
+        else:
+            for bouquet in bouquets:
+                name = (bouquet["name"] or bouquet["file"]).replace("<", "&lt;").replace(">", "&gt;")
+                count = len(bouquet["services"])
+                html_parts.append(
+                    '<div class="bq">'
+                    '<div class="bq-hdr" onclick="toggle(this)">'
+                    '<span class="bq-arrow">&#9654;</span>'
+                    '<span class="bq-name">%s</span>'
+                    '<span class="bq-badge">%d</span>'
+                    '</div>'
+                    '<div class="ch-list">' % (name, count)
+                )
+                if count == 0:
+                    html_parts.append('<div class="ch-empty">Keine Sender in diesem Bouquet.</div>')
+                else:
+                    for service in bouquet["services"]:
+                        encoded_ref = urllib.parse.quote(service["ref"], safe="")
+                        display = service["name"].replace("<", "&lt;").replace(">", "&gt;")
+                        html_parts.append(
+                            '<a class="ch" href="/player?ref=%s">'
+                            '<span class="ch-dot"></span>'
+                            '<span class="ch-name">%s</span>'
+                            '<span class="ch-play">&#9654;</span>'
+                            '</a>' % (encoded_ref, display)
+                        )
+                html_parts.append('</div></div>')
+
+        html_parts.append("""</div>
+</main>
+<footer>E2HLS Server &bull; Sender anklicken zum Starten des Streams</footer>
+<script>
+function toggle(hdr){hdr.closest('.bq').classList.toggle('open')}
+
+const inp=document.getElementById('q');
+inp.addEventListener('input',function(){
+  const q=this.value.toLowerCase();
+  document.querySelectorAll('.bq').forEach(function(bq){
+    let n=0;
+    bq.querySelectorAll('.ch').forEach(function(ch){
+      const m=!q||ch.querySelector('.ch-name').textContent.toLowerCase().includes(q);
+      ch.style.display=m?'':'none';
+      if(m)n++;
+    });
+    bq.style.display=(n>0||!q)?'':'none';
+    if(q&&n>0)bq.classList.add('open');
+    else if(!q)bq.classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>""")
+
+        return "".join(html_parts)
 
 
 class HlsHttpServer(object):

@@ -94,8 +94,9 @@ DEFAULT_INACTIVITY_TIMEOUT = 45
 
 config.plugins.e2hlsserver = ConfigSubsection()
 config.plugins.e2hlsserver.enabled = ConfigSelection(default="false", choices=[("true", _("Yes")), ("false", _("No"))])
-config.plugins.e2hlsserver.port = ConfigInteger(default=8080, limits=(1024, 65535))
+config.plugins.e2hlsserver.port = ConfigInteger(default=8003, limits=(1024, 65535))
 config.plugins.e2hlsserver.stream_port = ConfigInteger(default=8001, limits=(1000, 9999))
+config.plugins.e2hlsserver.stream_hw_port = ConfigInteger(default=8002, limits=(1000, 9999))
 config.plugins.e2hlsserver.autostart = ConfigSelection(default="false", choices=[("true", _("Yes")), ("false", _("No"))])
 config.plugins.e2hlsserver.debug = ConfigSelection(default="false", choices=[("true", _("Yes")), ("false", _("No"))])
 config.plugins.e2hlsserver.bind_ip = ConfigText(default="auto")
@@ -103,6 +104,20 @@ config.plugins.e2hlsserver.hls_dir = ConfigText(default="/tmp/fakehls")
 config.plugins.e2hlsserver.segment_duration = ConfigInteger(default=2, limits=(2, 30))
 config.plugins.e2hlsserver.cleanup_interval = ConfigInteger(default=10, limits=(5, 300))
 config.plugins.e2hlsserver.inactivity_timeout = ConfigInteger(default=45, limits=(10, 3600))
+
+
+def read_e2_credentials():
+	try:
+		with open("/etc/enigma2/settings", "r") as handle:
+			user, pw = "root", ""
+			for line in handle:
+				if line.startswith("config.OpenWebif.auth_user="):
+					user = line.split("=", 1)[1].strip()
+				elif line.startswith("config.ipboxclient.password="):
+					pw = line.split("=", 1)[1].strip()
+			return user, pw
+	except Exception:
+		return "root", ""
 
 
 def ensure_hls_dir(hls_dir=None):
@@ -179,6 +194,12 @@ class Enigma2Settings(object):
 
 	def stream_port(self):
 		return config.plugins.e2hlsserver.stream_port.value
+
+	def stream_hw_port(self):
+		try:
+			return config.plugins.e2hlsserver.stream_hw_port.value
+		except Exception:
+			return 8002
 
 	def hls_dir(self):
 		return config.plugins.e2hlsserver.hls_dir.value
