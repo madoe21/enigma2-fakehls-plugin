@@ -16,6 +16,10 @@ QUALITY_PRESETS = {
 }
 
 
+# MPEG transport stream packets are fixed-size; segments must cut on this grid.
+TS_PACKET_SIZE = 188
+
+
 class Segmenter(threading.Thread):
     PIPE_READ_SIZE = 65536
 
@@ -43,14 +47,16 @@ class Segmenter(threading.Thread):
         return self._stop_event.is_set()
 
     def segment_path(self, index):
-        slot = index % (self.settings.playlist_size() + 1)
-        return os.path.join(self.hls_dir, self.stream_id + "_ring%02d.ts" % slot)
+        # Unique, monotonically increasing names. Reusing a fixed set of ring
+        # slots violates the HLS spec (same URI, new content) — VLC matches
+        # live-playlist reloads by URI and stalls on recycled names.
+        return os.path.join(self.hls_dir, self.stream_id + "_seg%05d.ts" % index)
 
     def segment_url(self, index):
         ip_addr = self.local_ip_provider()
         port = self.settings.http_port()
-        slot = index % (self.settings.playlist_size() + 1)
-        return "http://" + ip_addr + ":" + str(port) + "/hls/" + self.stream_id + "_ring%02d.ts" % slot
+        return ("http://" + ip_addr + ":" + str(port) + "/hls/"
+                + self.stream_id + "_seg%05d.ts" % index)
 
     def create_pipe(self):
         if os.path.exists(self.pipe_path):
@@ -92,10 +98,12 @@ class Segmenter(threading.Thread):
 
                 buffer_data.extend(chunk)
                 now = time.time()
-                if now - segment_start >= self._seg_duration:
-                    if buffer_data:
-                        self._write_segment(bytes(buffer_data))
-                        buffer_data = bytearray()
+                if now - segment_start >= self._seg_duration and len(buffer_data) >= TS_PACKET_SIZE:
+                    # Cut on a TS packet boundary; a segment starting mid-packet
+                    # forces decoders to resync (VLC often refuses entirely).
+                    cut = len(buffer_data) - (len(buffer_data) % TS_PACKET_SIZE)
+                    self._write_segment(bytes(buffer_data[:cut]), now - segment_start)
+                    del buffer_data[:cut]
                     segment_start = now
 
                 self._clean_old_segments()
@@ -108,9 +116,9 @@ class Segmenter(threading.Thread):
                 pass
 
             if buffer_data and not self.stopped():
-                self._write_segment(bytes(buffer_data))
+                self._write_segment(bytes(buffer_data), self._seg_duration)
 
-    def _write_segment(self, data):
+    def _write_segment(self, data, duration):
         if len(data) < 8 * 1024:
             return
 
@@ -121,7 +129,7 @@ class Segmenter(threading.Thread):
             with open(seg_path, "wb") as handle:
                 handle.write(data)
 
-            self.segments.append((self.segment_index, seg_path, created_at))
+            self.segments.append((self.segment_index, seg_path, created_at, duration))
             self.segment_index += 1
             if self.segments:
                 self._update_playlist()
@@ -132,14 +140,17 @@ class Segmenter(threading.Thread):
         try:
             active = self.segments[-self.settings.playlist_size():]
             first_seq = active[0][0]
+            # Players schedule fetches from EXTINF; report measured durations,
+            # not the nominal target, or the live edge drifts and stutters.
+            max_duration = max(seg[3] for seg in active)
 
             content = "#EXTM3U\n"
             content += "#EXT-X-VERSION:3\n"
-            content += "#EXT-X-TARGETDURATION:" + str(self._seg_duration + 1) + "\n"
+            content += "#EXT-X-TARGETDURATION:" + str(int(max_duration) + 1) + "\n"
             content += "#EXT-X-MEDIA-SEQUENCE:" + str(first_seq) + "\n"
 
-            for idx, _seg_path, _created_at in active:
-                content += "#EXTINF:" + str(float(self._seg_duration)) + ",\n"
+            for idx, _seg_path, _created_at, duration in active:
+                content += "#EXTINF:%.3f,\n" % duration
                 content += self.segment_url(idx) + "\n"
 
             tmp_path = self.playlist + ".tmp"
@@ -150,13 +161,20 @@ class Segmenter(threading.Thread):
             self.logger.error("Error updating playlist: " + str(exc))
 
     def _clean_old_segments(self):
+        # Keep one segment beyond the playlist window so a client that just
+        # fetched the previous playlist can still load its oldest entry.
         keep = self.settings.playlist_size() + 1
         if len(self.segments) > keep:
+            for _idx, seg_path, _created_at, _duration in self.segments[:-keep]:
+                try:
+                    if os.path.exists(seg_path):
+                        os.unlink(seg_path)
+                except Exception:
+                    pass
             self.segments = self.segments[-keep:]
 
     def cleanup_all(self):
-        for slot in range(self.settings.playlist_size() + 1):
-            seg_path = os.path.join(self.hls_dir, self.stream_id + "_ring%02d.ts" % slot)
+        for _idx, seg_path, _created_at, _duration in self.segments:
             try:
                 if os.path.exists(seg_path):
                     os.unlink(seg_path)
