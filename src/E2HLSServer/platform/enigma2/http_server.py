@@ -6,12 +6,21 @@ import json
 import os
 import re
 import urllib.parse
-import urllib.request
 
+from twisted.internet import reactor
 from twisted.web.resource import Resource
-from twisted.web.server import Site
+from twisted.web.server import NOT_DONE_YET, Site
 
 from .config import HTML_TEMPLATE_FILE, get_favicon_path
+
+try:
+    from enigma import eServiceCenter, eServiceReference
+except ImportError:  # not running inside enigma2 (dev machine, tests)
+    eServiceCenter = None
+    eServiceReference = None
+
+# enigma2 stores the channel lists (bouquets) as plain text files here.
+BOUQUET_DIR = "/etc/enigma2"
 
 _WEB_HTML = r"""<!DOCTYPE html>
 <html lang="de">
@@ -37,8 +46,13 @@ body { background: #0d0d0d; color: #f0f0f0; font-family: sans-serif; height: 100
 .ch:hover { background: #1e1e1e; }
 .ch.active { background: #003322; color: #00cc88; border-left: 3px solid #00cc88; padding-left: calc(1rem - 3px); }
 #right { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
-#video-area { flex: 1; background: #000; display: flex; align-items: center; justify-content: center; position: relative; }
-video { width: 100%; height: 100%; display: block; }
+/* min-height:0 lets the flex item shrink below the video's intrinsic size —
+   without it the video pushes the URL bar out of the viewport. */
+#video-area { flex: 1; min-height: 0; background: #000; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
+video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+#fullscreen-btn { position: absolute; bottom: 0.8rem; right: 0.8rem; z-index: 10; background: rgba(0,0,0,0.7); border: 1px solid #333; border-radius: 6px; color: #aaa; font-size: 1.1rem; width: 40px; height: 40px; cursor: pointer; display: none; align-items: center; justify-content: center; user-select: none; }
+#fullscreen-btn:hover { background: rgba(0,204,136,0.2); color: #00cc88; border-color: #00cc88; }
+#video-area.playing #fullscreen-btn { display: flex; }
 #placeholder { color: #444; font-size: 1rem; text-align: center; line-height: 2.2; }
 #toggle-list { position: absolute; top: 50%; left: 0; transform: translateY(-50%); z-index: 10; background: rgba(0,0,0,0.7); border: 1px solid #333; border-left: none; border-radius: 0 6px 6px 0; color: #aaa; font-size: 1.1rem; width: 22px; height: 56px; cursor: pointer; display: flex; align-items: center; justify-content: center; user-select: none; }
 #toggle-list:hover { background: rgba(0,204,136,0.2); color: #00cc88; }
@@ -77,9 +91,10 @@ video { width: 100%; height: 100%; display: block; }
     <div id="video-area">
       <button id="toggle-list" onclick="toggleList()">&#9664;</button>
       <div id="placeholder">Lade Senderliste&#8230;</div>
-      <video id="v" controls autoplay style="display:none"></video>
+      <video id="v" controls style="display:none"></video>
+      <button id="fullscreen-btn" onclick="toggleFullscreen()" title="Vollbild (Escape beendet)">&#x26F6;</button>
       <div id="now"></div>
-      <div id="loading"><div class="spinner"></div><span style="color:#aaa;font-size:0.9rem">Starte Stream&#8230;</span></div>
+      <div id="loading"><div class="spinner"></div><span id="loading-text" style="color:#aaa;font-size:0.9rem">Starte Stream&#8230;</span></div>
       <div id="msg"></div>
     </div>
     <div id="url-bar">
@@ -90,7 +105,29 @@ video { width: 100%; height: 100%; display: block; }
   </div>
 </div>
 <script>
-let all = [], filtered = [], cur = -1, listVisible = true, hls = null;
+let all = [], filtered = [], cur = -1, listVisible = true, hls = null, bufferTimer = null;
+const PREBUFFER_SECONDS = 12;
+
+// Hold playback until enough forward buffer exists. Starting immediately on a
+// fresh stream means playing exactly as fast as ffmpeg produces — zero
+// reserve, so every hiccup stalls. Waiting once up front buys smoothness.
+function startWhenBuffered(v) {
+  if (bufferTimer) clearInterval(bufferTimer);
+  const t0 = Date.now();
+  bufferTimer = setInterval(() => {
+    let buf = 0;
+    if (v.buffered.length) buf = v.buffered.end(v.buffered.length - 1) - v.currentTime;
+    const waited = (Date.now() - t0) / 1000;
+    document.getElementById('loading-text').textContent =
+      'Puffere… ' + Math.floor(Math.min(buf, PREBUFFER_SECONDS)) + '/' + PREBUFFER_SECONDS + 's';
+    if (buf >= PREBUFFER_SECONDS || waited > PREBUFFER_SECONDS + 15) {
+      clearInterval(bufferTimer);
+      bufferTimer = null;
+      document.getElementById('loading').classList.remove('show');
+      v.play().catch(() => {});
+    }
+  }, 250);
+}
 
 function onQualityChange() { if (cur >= 0) play(cur); }
 
@@ -161,36 +198,40 @@ async function play(i) {
   cur = i;
   const ch = filtered[i];
   const v = document.getElementById('v');
+  if (bufferTimer) { clearInterval(bufferTimer); bufferTimer = null; }
   document.getElementById('placeholder').style.display = 'none';
+  document.getElementById('loading-text').textContent = 'Starte Stream…';
   document.getElementById('loading').classList.add('show');
+  document.getElementById('video-area').classList.add('playing');
   v.style.display = 'block';
   if (hls) { hls.destroy(); hls = null; }
   v.pause(); v.removeAttribute('src'); v.load();
   try {
     const quality = document.getElementById('quality-select').value;
-    const r = await fetch('/api/start?ref=' + encodeURIComponent(ch.ref) + '&quality=' + quality);
-    if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
-    const data = await r.json();
-    const hlsUrl = '/hls/' + data.playlist;
+    // OpenWebInterface-style URL: /<service-ref> starts the stream and
+    // redirects to its HLS playlist — same shape as the STB streaming port.
+    const hlsUrl = '/' + ch.ref + '?quality=' + quality;
     document.getElementById('url-bar').style.display = 'flex';
-    document.getElementById('url-text').textContent = window.location.origin + hlsUrl;
+    document.getElementById('url-text').textContent = window.location.origin + '/' + ch.ref;
     if (Hls.isSupported()) {
       hls = new Hls({
-        liveSyncDurationCount: 2,
-        liveMaxLatencyDurationCount: 5,
+        // Sit 6 segments (~12s) behind the live edge; chasing it with only one
+        // buffered segment causes a stall on every segment boundary.
+        liveSyncDurationCount: 6,
+        liveMaxLatencyDurationCount: 18,
+        maxBufferLength: 30,
+        backBufferLength: 30,
+        // the root route holds the request until the playlist exists (up to 10s)
+        manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 10,
         manifestLoadingRetryDelay: 500,
         fragLoadingMaxRetry: 10,
         levelLoadingMaxRetry: 10,
         liveSyncOnStallEnabled: true,
-        maxLiveSyncPlaybackRate: 1.5,
       });
       hls.loadSource(hlsUrl);
       hls.attachMedia(v);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        document.getElementById('loading').classList.remove('show');
-        v.play().catch(()=>{});
-      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => startWhenBuffered(v));
       hls.on(Hls.Events.ERROR, (_, d) => {
         if (d.fatal) {
           document.getElementById('loading').classList.remove('show');
@@ -199,7 +240,7 @@ async function play(i) {
       });
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
       v.src = hlsUrl;
-      v.oncanplay = () => { document.getElementById('loading').classList.remove('show'); v.play().catch(()=>{}); };
+      v.oncanplay = () => startWhenBuffered(v);
     }
   } catch(e) {
     document.getElementById('loading').classList.remove('show');
@@ -212,9 +253,40 @@ async function play(i) {
   document.querySelectorAll('.ch')[i]?.scrollIntoView({block:'nearest'});
 }
 
+let lastFsExit = 0;
+function toggleFullscreen() {
+  const area = document.getElementById('video-area');
+  if (document.fullscreenElement) document.exitFullscreen();
+  else area.requestFullscreen().catch(() => {});
+}
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) lastFsExit = Date.now();
+  const btn = document.getElementById('fullscreen-btn');
+  btn.innerHTML = document.fullscreenElement ? '&#x2715;' : '&#x26F6;';
+  btn.title = document.fullscreenElement ? 'Vollbild beenden (Escape)' : 'Vollbild (Escape beendet)';
+});
+document.getElementById('v').addEventListener('dblclick', toggleFullscreen);
+
 function copyUrl() {
-  navigator.clipboard.writeText(document.getElementById('url-text').textContent)
-    .then(() => { const b = document.getElementById('copy-btn'); b.textContent='✓'; setTimeout(()=>b.textContent='Kopieren',2000); });
+  const text = document.getElementById('url-text').textContent;
+  const done = () => { const b = document.getElementById('copy-btn'); b.textContent='✓'; setTimeout(() => b.textContent='Kopieren', 2000); };
+  // navigator.clipboard exists only in secure contexts (HTTPS/localhost);
+  // this page is plain HTTP, so fall back to execCommand-based copying.
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); done(); } catch (e) { showMsg('Kopieren fehlgeschlagen'); }
+  document.body.removeChild(ta);
 }
 function showMsg(t, ms=3000) {
   const el = document.getElementById('msg');
@@ -229,6 +301,10 @@ document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
   if (e.key === 'ArrowDown') play(Math.min(cur+1, filtered.length-1));
   if (e.key === 'ArrowUp')   play(Math.max(cur-1, 0));
+  if (e.key === 'f' && cur >= 0) toggleFullscreen();
+  // Escape right after leaving fullscreen is the browser's exit key,
+  // not a request to toggle the channel list.
+  if (e.key === 'Escape' && Date.now() - lastFsExit < 500) return;
   if (e.key === 'Escape' || e.key === 'Tab') toggleList();
 });
 window.addEventListener('load', loadBouquets);
@@ -289,9 +365,10 @@ class HlsRoot(Resource):
 
         # OpenWebInterface-style streaming: http://<box-ip>:<port>/<service-ref>
         # (same URL shape as the STB streaming port, just HLS on this port).
-        ref_path = path[1:]
+        # Unquote first so percent-encoded refs (e.g. %3A for ':') match too.
+        ref_path = urllib.parse.unquote(path[1:])
         if re.match(r"^\d+:\d", ref_path):
-            return self.render_root_stream(request, urllib.parse.unquote(ref_path))
+            return self.render_root_stream(request, ref_path)
 
         request.setResponseCode(404)
         return b"Not Found"
@@ -398,16 +475,34 @@ class HlsRoot(Resource):
             request.setResponseCode(500)
             return b"Failed to start stream"
 
-        import time
+        return self._redirect_when_playlist_ready(request, stream_id)
 
+    def _redirect_when_playlist_ready(self, request, stream_id):
+        """Redirect to the stream's playlist once it exists, without blocking.
+
+        NEVER time.sleep() in a request handler here: the Twisted reactor
+        shares enigma2's main event loop, which also drives the GUI and the
+        port-8001 stream source ffmpeg reads from. Sleeping stalls that
+        source, so the playlist we are waiting for can never appear.
+        """
         playlist = os.path.join(self.settings.hls_dir(), "live_" + stream_id + ".m3u8")
-        for _ in range(20):
-            if os.path.exists(playlist):
-                break
-            time.sleep(0.5)
+        state = {"gone": False}
+        request.notifyFinish().addErrback(lambda _f: state.update(gone=True))
 
-        request.redirect(("/hls/live_" + stream_id + ".m3u8").encode())
-        return b""
+        def poll(remaining):
+            if state["gone"]:
+                return
+            if os.path.exists(playlist) or remaining <= 0:
+                try:
+                    request.redirect(("/hls/live_" + stream_id + ".m3u8").encode())
+                    request.finish()
+                except Exception:
+                    pass
+                return
+            reactor.callLater(0.25, poll, remaining - 1)
+
+        poll(40)  # up to 10 s
+        return NOT_DONE_YET
 
     def render_root_stream(self, request, ref):
         """Stream a service given directly in the path (OpenWebInterface style).
@@ -421,8 +516,14 @@ class HlsRoot(Resource):
         args = request.args
         q_user = args.get(b"user", [None])[0]
         q_pass = args.get(b"pass", [None])[0]
+        q_quality = args.get(b"quality", [None])[0]
+        from ...core.stream_service import QUALITY_PRESETS
+        quality = q_quality.decode() if q_quality else "balanced"
+        if quality not in QUALITY_PRESETS:
+            quality = "balanced"
         params = {
             "ref": ref,
+            "quality": quality,
             "user": urllib.parse.unquote(q_user.decode()) if q_user else header_user,
             "password": urllib.parse.unquote(q_pass.decode()) if q_pass else header_pass,
         }
@@ -432,25 +533,20 @@ class HlsRoot(Resource):
             request.setResponseCode(500)
             return b"Failed to start stream"
 
-        import time
-
-        playlist = os.path.join(self.settings.hls_dir(), "live_" + stream_id + ".m3u8")
-        for _ in range(20):
-            if os.path.exists(playlist):
-                break
-            time.sleep(0.5)
-
-        request.redirect(("/hls/live_" + stream_id + ".m3u8").encode())
-        return b""
+        return self._redirect_when_playlist_ready(request, stream_id)
 
     def render_hls(self, request):
         path = request.path.decode()
         filename = path.split("/")[-1]
         filepath = os.path.join(self.settings.hls_dir(), filename)
 
+        # Every fetch counts as activity — playlist AND segments. Some players
+        # (VLC caches aggressively) fetch segments without re-reading the
+        # playlist; counting only playlist hits kills streams mid-watch.
         if filename.startswith("live_") and filename.endswith(".m3u8"):
-            stream_id = filename[5:-5]
-            self.stream_service.update_access(stream_id)
+            self.stream_service.update_access(filename[5:-5])
+        elif filename.endswith(".ts") and "_" in filename:
+            self.stream_service.update_access(filename.split("_", 1)[0])
 
         if not os.path.exists(filepath):
             request.setResponseCode(404)
@@ -511,7 +607,7 @@ class HlsRoot(Resource):
             return ("Error reading logs: " + str(exc)).encode()
 
     def render_debug_bouquets(self, request):
-        bouquet_dir = "/etc/enigma2"
+        bouquet_dir = BOUQUET_DIR
         lines = ["=== Bouquet Debug ===\n"]
         try:
             files = sorted(os.listdir(bouquet_dir))
@@ -552,12 +648,6 @@ class HlsRoot(Resource):
         request.setHeader(b"Content-Type", b"text/plain; charset=utf-8")
         return "".join(lines).encode("utf-8")
 
-    def _e2_api_get(self, path):
-        url = "http://localhost:80" + path
-        req = urllib.request.Request(url, headers={"User-Agent": "E2HLSServer"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
     def _json_response(self, request, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         request.setResponseCode(status)
@@ -566,11 +656,17 @@ class HlsRoot(Resource):
         return body
 
     def render_api_bouquets(self, request):
+        # Parse /etc/enigma2 directly — the plugin runs on the receiver, so no
+        # OpenWebif round-trip is needed (and none may be installed).
         try:
-            data = self._e2_api_get("/api/getservices")
+            top_file = os.path.join(BOUQUET_DIR, "bouquets.tv")
+            if not os.path.exists(top_file):
+                self.logger.error("API bouquets: %s not found" % top_file)
+                return self._json_response(
+                    request, {"error": "bouquets.tv not found"}, 500)
             bouquets = [
-                {"name": s["servicename"], "ref": s["servicereference"]}
-                for s in data.get("services", [])
+                {"name": name, "ref": filename}
+                for name, filename in self._parse_top_bouquet_file(top_file)
             ]
             return self._json_response(request, bouquets)
         except Exception as exc:
@@ -583,14 +679,16 @@ class HlsRoot(Resource):
             return self._json_response(request, {"error": "Missing ref"}, 400)
         ref = urllib.parse.unquote(ref_raw.decode())
         try:
-            encoded = urllib.parse.quote(ref, safe="")
-            data = self._e2_api_get("/api/getservices?sRef=" + encoded)
-            channels = []
-            for s in data.get("services", []):
-                r = s.get("servicereference", "")
-                if r and not r.startswith("1:64:") and "::" not in r:
-                    channels.append({"name": s.get("servicename", "Unknown"), "ref": r})
-            return self._json_response(request, channels)
+            # Accept either a bouquet filename (as returned by /api/bouquets)
+            # or a full '1:7:1:...FROM BOUQUET "file"...' service reference.
+            match = re.search(r'FROM BOUQUET "([^"]+)"', ref)
+            filename = match.group(1) if match else ref
+            # basename() blocks path traversal via crafted refs
+            path = os.path.join(BOUQUET_DIR, os.path.basename(filename))
+            if not os.path.exists(path):
+                return self._json_response(
+                    request, {"error": "Bouquet not found: " + filename}, 404)
+            return self._json_response(request, self._parse_channel_file(path))
         except Exception as exc:
             self.logger.error("API channels error: " + str(exc))
             return self._json_response(request, {"error": str(exc)}, 500)
@@ -623,7 +721,7 @@ class HlsRoot(Resource):
     def _load_bouquets(self):
         bouquets = []
         errors = []
-        bouquet_dir = "/etc/enigma2"
+        bouquet_dir = BOUQUET_DIR
         top_file = os.path.join(bouquet_dir, "bouquets.tv")
 
         try:
@@ -647,7 +745,6 @@ class HlsRoot(Resource):
         return bouquets, errors
 
     def _parse_top_bouquet_file(self, path):
-        import re
         # collect (ref, description_or_None) pairs
         entries = []
         current_ref = None
@@ -713,8 +810,27 @@ class HlsRoot(Resource):
                     if description:
                         current_service["name"] = description
 
+        # Most bouquet files carry no #DESCRIPTION — channel names live in
+        # enigma2's service database (lamedb), so resolve them there.
+        for channel in channels:
+            if not channel["name"]:
+                channel["name"] = self._resolve_service_name(channel["ref"])
+
         # drop entries without a readable name
         return [ch for ch in channels if ch["name"]]
+
+    def _resolve_service_name(self, ref):
+        """Look up a channel name in enigma2's service database."""
+        if eServiceCenter is None or eServiceReference is None:
+            return ""
+        try:
+            service = eServiceReference(ref)
+            info = eServiceCenter.getInstance().info(service)
+            name = info.getName(service) if info else ""
+            return name or ""
+        except Exception as exc:
+            self.logger.debug("Name lookup failed for %s: %s" % (ref, exc))
+            return ""
 
     def _build_web_html(self, bouquets, errors):
         html_parts = ["""<!DOCTYPE html>
