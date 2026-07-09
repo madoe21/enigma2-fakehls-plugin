@@ -201,8 +201,12 @@ deploy:
 	             find $(BOX_PLUGIN_DIR) -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
 	             true"
 
-	@echo "Restarting Enigma2..."
-	@$(BOX_SSH) "killall -HUP enigma2" 2>/dev/null || true
+	@echo "Restarting Enigma2 (clean runlevel restart)..."
+	@# killall -HUP makes the inittab respawn wrapper misread the exit code
+	@# and power the box down ~120s later. init 4 / init 3 is the clean way.
+	@$(BOX_SSH) "sync; init 4" 2>/dev/null || true
+	@sleep 12
+	@$(BOX_SSH) "init 3" 2>/dev/null || true
 
 	@echo ""
 	@echo "Deploy complete!"
