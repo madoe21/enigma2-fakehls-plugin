@@ -42,6 +42,14 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
         "5",
         "-timeout",
         "30000000",
+        # Copy mode only needs PAT/PMT + codec ids; the 5 MB default probe
+        # costs several seconds of startup on an HD transport stream.
+        "-probesize",
+        "1000000",
+        "-analyzeduration",
+        "1000000",
+        "-fflags",
+        "nobuffer",
     ]
     if e2_user and e2_pass:
         creds = base64.b64encode((e2_user + ":" + e2_pass).encode()).decode()
@@ -55,8 +63,18 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
         "0:a:0?",
         "-sn",
         "-dn",
-        "-c",
+        # Video stays copy (no re-encode). Audio must be transcoded: broadcast
+        # TV carries AC-3/MP2, which no browser can decode via MSE — hls.js
+        # then stalls on the dead audio track (buffered but not playing).
+        # AAC stereo plays everywhere, including VLC.
+        "-c:v",
         "copy",
+        "-c:a",
+        "aac",
+        "-ac",
+        "2",
+        "-b:a",
+        "192k",
         "-copyts",
         "-start_at_zero",
         "-f",

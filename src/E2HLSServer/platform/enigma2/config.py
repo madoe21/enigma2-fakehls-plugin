@@ -86,7 +86,9 @@ def get_favicon_path():
 
 # Fallbacks when Enigma2 config is unavailable.
 DEFAULT_SEGMENT_DURATION = 2
-DEFAULT_PLAYLIST_SIZE = 3
+# 12 x 2s segments = 24s live window; gives the web player ~10s forward buffer
+# while keeping tmpfs usage bounded (playlist_size + 1 segment files, ~32 MB).
+DEFAULT_PLAYLIST_SIZE = 12
 DEFAULT_SEGMENT_MAX_AGE = 30
 DEFAULT_CLEANUP_INTERVAL = 10
 DEFAULT_INACTIVITY_TIMEOUT = 45

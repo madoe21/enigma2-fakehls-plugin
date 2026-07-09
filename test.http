@@ -1,6 +1,6 @@
 @boxIp = {{$dotenv BOX_HOST}}
-@httpPort = 8080
-@serviceRef = 1:0:1:445D:453:1:C00000:0:0:0:
+@httpPort = 8003
+@serviceRef = 1:0:19:283D:3FB:1:C00000:0:0:0:
 @streamUser = {{$dotenv STREAM_USER}}
 @streamPass = {{$dotenv STREAM_PASS}}
 
@@ -19,3 +19,19 @@ Accept: application/vnd.apple.mpegurl
 ### 4) Fetch server logs
 GET http://{{boxIp}}:{{httpPort}}/logs
 Accept: text/plain
+
+### 5) OpenWebInterface-style root streaming (redirects to HLS playlist)
+GET http://{{boxIp}}:{{httpPort}}/{{serviceRef}}
+Accept: application/vnd.apple.mpegurl
+
+### 6) List bouquets (parsed locally from /etc/enigma2)
+GET http://{{boxIp}}:{{httpPort}}/api/bouquets
+Accept: application/json
+
+### 7) List channels of a bouquet (names resolved via lamedb)
+GET http://{{boxIp}}:{{httpPort}}/api/channels?ref=userbouquet.favourites.tv
+Accept: application/json
+
+### 8) Missing bouquet returns 404
+GET http://{{boxIp}}:{{httpPort}}/api/channels?ref=does-not-exist.tv
+Accept: application/json
