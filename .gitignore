@@ -8,3 +8,9 @@ __pycache__/
 *.swo
 .env
 .vscode/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "enigma2_fakehls_plugin",
+  "project_id": "4d410416-ca50-4527-80ef-8f3491cac05d"
+}

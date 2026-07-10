@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Enforce the branching governance model (.aiflow/branching.json):
+#  - PR-only: no direct push to protected branches (main/develop)
+#  - strict naming: pushed branch must match an allowed branch type
+# Bypass (e.g. for the release process): AIFLOW_ALLOW_DIRECT_PUSH=1
+set -uo pipefail
+
+# aiflow: sync Beads issues <-> GitHub before push (non-fatal). Needs GITHUB_TOKEN in env
+# and github.owner/repo configured (aiflow apply does this). Skips silently otherwise.
+if [ -d .beads ] && command -v bd >/dev/null 2>&1 && [ -n "${GITHUB_TOKEN:-}" ] \
+   && [ "$(command -v jq >/dev/null 2>&1 && jq -r '.vcs // "github"' .aiflow/config.json 2>/dev/null || echo github)" = github ]; then
+  bd github sync >/dev/null 2>&1 || echo "  ! bd github sync failed (continuing push)" >&2
+fi
+
+MODEL=".aiflow/branching.json"
+[ -f "$MODEL" ] || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+[ "${AIFLOW_ALLOW_DIRECT_PUSH:-}" = "1" ] && exit 0
+
+PRONLY="$(jq -r '.pullRequests.required // false' "$MODEL")"
+PROTECTED="$(jq -r '(.pullRequests.protectedBranches // ["main","develop"]) | join(" ")' "$MODEL")"
+STRICT="$(jq -r 'if .branchNaming=="enforced" then "true" else "false" end' "$MODEL")"
+TYPES="$(jq -r '(.permanentBranches + ([.branchTypes[] | sub("/\\*$";"/")])) | join(" ")' "$MODEL")"
+
+fail() { echo "✗ pre-push (branching): $1" >&2; echo "  see docs/branching.md — bypass with AIFLOW_ALLOW_DIRECT_PUSH=1 (discouraged)" >&2; exit 1; }
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>
+while read -r lref lsha rref rsha; do
+  [ -z "${rref:-}" ] && continue
+  branch="${rref#refs/heads/}"
+
+  # PR-only: block direct pushes to protected branches
+  if [ "$PRONLY" = true ]; then
+    for p in $PROTECTED; do
+      [ "$branch" = "$p" ] && fail "direct push to protected branch '$branch' is not allowed (merge via Pull Request)"
+    done
+  fi
+
+  # strict naming: branch must be permanent or match an allowed type prefix
+  if [ "$STRICT" = true ]; then
+    ok=false
+    for t in $TYPES; do
+      case "$t" in
+        */) [[ "$branch" == ${t}* ]] && ok=true ;;   # type prefix, e.g. feature/
+        *)  [ "$branch" = "$t" ] && ok=true ;;        # exact permanent branch
+      esac
+    done
+    [ "$ok" = true ] || fail "branch name '$branch' does not match an allowed type ($TYPES)"
+  fi
+done
+exit 0
+
+# --- BEGIN BEADS INTEGRATION v1.0.5 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  _bd_used_perl=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run pre-push "$@"
+    _bd_exit=$?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$_bd_timeout" bd hooks run pre-push "$@"
+    _bd_exit=$?
+  elif command -v perl >/dev/null 2>&1; then
+    _bd_used_perl=1
+    perl -e 'alarm shift; exec @ARGV' "$_bd_timeout" bd hooks run pre-push "$@"
+    _bd_exit=$?
+  else
+    echo >&2 "beads: hook 'pre-push' running without timeout; install coreutils or perl to enable BEADS_HOOK_TIMEOUT"
+    bd hooks run pre-push "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 124 ] || { [ $_bd_used_perl -eq 1 ] && [ $_bd_exit -eq 142 ]; }; then
+    echo >&2 "beads: hook 'pre-push' timed out after ${_bd_timeout}s — continuing without beads"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'pre-push'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.0.5 ---
