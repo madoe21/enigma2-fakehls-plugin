@@ -3,6 +3,7 @@ from __future__ import absolute_import
 
 import os
 import sys
+import threading
 import traceback
 from datetime import datetime
 
@@ -14,6 +15,10 @@ class PluginLogger(object):
     ERROR = 40
     CRITICAL = 50
 
+    # The log lives in tmpfs (RAM) — an unbounded file eventually starves
+    # the box. Rotate once past this size, keep one previous generation.
+    MAX_LOG_BYTES = 512 * 1024
+
     def __init__(self, name="HLSPlugin", log_dir="/tmp/fakehls/logs", debug_mode=False):
         self.name = name
         self.debug_mode = debug_mode
@@ -21,7 +26,13 @@ class PluginLogger(object):
         self.log_file = os.path.join(log_dir, "plugin.log")
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # One persistent line-buffered handle instead of open/close per
+        # line; writers include the reactor and the segmenter thread.
+        self._lock = threading.Lock()
+        self._handle = None
+
         self._ensure_directories()
+        self._open_log()
         self._write_raw_log("=" * 80)
         self._write_raw_log("PLUGIN SESSION STARTED - " + self.session_id)
         self._write_raw_log("   Log Level: " + ("DEBUG" if debug_mode else "INFO"))
@@ -32,16 +43,42 @@ class PluginLogger(object):
         try:
             if not os.path.exists(self.log_dir):
                 os.makedirs(self.log_dir, mode=0o755)
-                self._write_raw_log("Created directory: " + self.log_dir)
         except Exception as exc:
             print("EMERGENCY: Failed to create log directory: " + str(exc))
 
-    def _write_raw_log(self, message):
+    def _open_log(self):
         try:
-            with open(self.log_file, "a", encoding="utf-8") as handle:
-                handle.write(message + "\n")
+            self._handle = open(self.log_file, "a", encoding="utf-8", buffering=1)
+        except Exception as exc:
+            self._handle = None
+            print("CRITICAL: Cannot open log file: " + str(exc))
+
+    def _rotate_locked(self):
+        """Swap the log for a fresh one; caller holds the lock."""
+        try:
+            self._handle.close()
         except Exception:
-            print("[" + self.name + "] " + message)
+            pass
+        self._handle = None
+        try:
+            os.replace(self.log_file, self.log_file + ".1")
+        except Exception:
+            pass
+        self._open_log()
+
+    def _write_raw_log(self, message):
+        with self._lock:
+            if self._handle is None:
+                self._open_log()
+            if self._handle is None:
+                print("[" + self.name + "] " + message)
+                return
+            try:
+                self._handle.write(message + "\n")
+                if self._handle.tell() > self.MAX_LOG_BYTES:
+                    self._rotate_locked()
+            except Exception:
+                print("[" + self.name + "] " + message)
 
     def _format_message(self, level, message, details=None):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -64,15 +101,10 @@ class PluginLogger(object):
             return
 
         log_line = self._format_message(level_name, message, details)
+        if exc_info and level >= self.ERROR:
+            log_line += "\n" + traceback.format_exc()
 
-        try:
-            with open(self.log_file, "a", encoding="utf-8") as handle:
-                handle.write(log_line + "\n")
-                if exc_info and level >= self.ERROR:
-                    traceback.print_exc(file=handle)
-        except Exception as exc:
-            print("CRITICAL: Cannot write to log file: " + str(exc))
-
+        self._write_raw_log(log_line)
         print("[" + self.name + "] [" + level_name + "] " + message)
 
     def debug(self, message, details=None):
@@ -146,3 +178,10 @@ class PluginLogger(object):
         self._write_raw_log("=" * 80)
         self._write_raw_log("PLUGIN SESSION ENDED - " + self.session_id)
         self._write_raw_log("=" * 80)
+        with self._lock:
+            if self._handle is not None:
+                try:
+                    self._handle.close()
+                except Exception:
+                    pass
+                self._handle = None

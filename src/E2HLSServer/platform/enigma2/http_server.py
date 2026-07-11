@@ -334,6 +334,12 @@ class HlsRoot(Resource):
         self.settings = settings
         self.local_ip_provider = local_ip_provider
         self.html_template = html_template
+        # Bouquet parsing triggers O(N) lamedb lookups per request on the
+        # shared reactor; cache per file mtime. Name lookups are cached for
+        # the process lifetime — lamedb only changes on a service scan,
+        # which comes with a GUI restart anyway.
+        self._channels_cache = {}
+        self._name_cache = {}
 
     def getChild(self, name, request):
         return self
@@ -710,7 +716,7 @@ class HlsRoot(Resource):
             if not os.path.exists(path):
                 return self._json_response(
                     request, {"error": "Bouquet not found: " + filename}, 404)
-            return self._json_response(request, self._parse_channel_file(path))
+            return self._json_response(request, self._channels_for(path))
         except Exception as exc:
             self.logger.error("API channels error: " + str(exc))
             return self._json_response(request, {"error": str(exc)}, 500)
@@ -809,6 +815,22 @@ class HlsRoot(Resource):
             pass
         return None
 
+    def _channels_for(self, path):
+        """Return cached channel list for *path*, keyed by (path, mtime)."""
+        try:
+            st = os.stat(path)
+            key = (path, st.st_mtime)
+        except OSError:
+            return []
+
+        cached = self._channels_cache.get(key)
+        if cached is not None:
+            return cached
+
+        channels = self._parse_channel_file(path)
+        self._channels_cache[key] = channels
+        return channels
+
     def _parse_channel_file(self, path):
         channels = []
         current_service = None
@@ -842,16 +864,23 @@ class HlsRoot(Resource):
         return [ch for ch in channels if ch["name"]]
 
     def _resolve_service_name(self, ref):
-        """Look up a channel name in enigma2's service database."""
+        """Look up a channel name in enigma2's service database, with cache."""
+        cached = self._name_cache.get(ref)
+        if cached is not None:
+            return cached
+
         if eServiceCenter is None or eServiceReference is None:
+            self._name_cache[ref] = ""
             return ""
         try:
             service = eServiceReference(ref)
             info = eServiceCenter.getInstance().info(service)
             name = info.getName(service) if info else ""
+            self._name_cache[ref] = name or ""
             return name or ""
         except Exception as exc:
             self.logger.debug("Name lookup failed for %s: %s" % (ref, exc))
+            self._name_cache[ref] = ""
             return ""
 
     def _build_web_html(self, bouquets, errors):
