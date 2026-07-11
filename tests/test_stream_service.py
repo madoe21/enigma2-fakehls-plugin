@@ -40,15 +40,29 @@ class FakeLogger(object):
     def debug(self, message, **_kwargs):
         pass
 
+    def log_ffmpeg_exit(self, _stream_id, _retcode, _log_file=None):
+        pass
+
 
 class FakeReactor(object):
+    def __init__(self):
+        self.marshalled = []
+
     def callLater(self, _delay, _fn, *_args):
         return None
+
+    def callFromThread(self, fn, *args):
+        self.marshalled.append((fn, args))
+        fn(*args)
 
 
 class FakeSegmenter(object):
     def __init__(self, segment_count):
         self.segments = [None] * segment_count
+        self.writer_exit_notified = False
+
+    def notify_writer_exited(self):
+        self.writer_exit_notified = True
 
 
 class StreamServiceTest(unittest.TestCase):
@@ -59,11 +73,12 @@ class StreamServiceTest(unittest.TestCase):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def _service(self, provider=None):
+        self.reactor = FakeReactor()
         return stream_service.StreamService(
             settings=FakeSettings(self.tmp_dir),
             logger=FakeLogger(),
             ensure_hls_dir=lambda _d: True,
-            reactor=FakeReactor(),
+            reactor=self.reactor,
             credentials_provider=provider,
         )
 
@@ -95,6 +110,48 @@ class StreamServiceTest(unittest.TestCase):
         self.assertEqual(status["abcd1234"]["segments"], 5)
         self.assertEqual(status["abcd1234"]["access_count"], 2)
         self.assertEqual(status["abcd1234"]["hls_url"], "/hls/live_abcd1234.m3u8")
+
+    def test_marshal_routes_callback_through_reactor(self):
+        service = self._service()
+        calls = []
+        wrapped = service._marshal(lambda *args: calls.append(args))
+        wrapped("sid", 1)
+        self.assertEqual(calls, [("sid", 1)])
+        self.assertEqual(len(self.reactor.marshalled), 1)
+
+    def test_ffmpeg_exit_notifies_segmenter_and_counts_crash(self):
+        service = self._service()
+        segmenter = FakeSegmenter(segment_count=0)
+        service.streams["abcd1234"] = {
+            "params": {"ref": "1:0:1"},
+            "started": time.time(),
+            "access_count": 1,
+            "crash_count": 0,
+            "process": object(),
+            "segmenter": segmenter,
+        }
+        service._on_ffmpeg_exit("abcd1234", 1, None)
+        self.assertTrue(segmenter.writer_exit_notified)
+        self.assertEqual(service.streams["abcd1234"]["crash_count"], 1)
+
+    def test_ffmpeg_exit_for_unknown_stream_is_ignored(self):
+        service = self._service()
+        service._on_ffmpeg_exit("gone", 1, None)  # must not raise
+
+    def test_clean_ffmpeg_exit_notifies_without_crash_count(self):
+        service = self._service()
+        segmenter = FakeSegmenter(segment_count=0)
+        service.streams["abcd1234"] = {
+            "params": {"ref": "1:0:1"},
+            "started": time.time(),
+            "access_count": 1,
+            "crash_count": 0,
+            "process": object(),
+            "segmenter": segmenter,
+        }
+        service._on_ffmpeg_exit("abcd1234", 0, None)
+        self.assertTrue(segmenter.writer_exit_notified)
+        self.assertEqual(service.streams["abcd1234"]["crash_count"], 0)
 
 
 if __name__ == "__main__":

@@ -175,9 +175,15 @@ class PluginLogger(object):
 
         if log_file and os.path.exists(log_file):
             try:
-                with open(log_file, "r", encoding="utf-8", errors="ignore") as handle:
-                    lines = handle.readlines()[-5:]
-                    details["Last FFmpeg output"] = "".join(lines)
+                # Bounded tail read — ffmpeg logs live in tmpfs and can grow
+                # large; reading the whole file to keep 5 lines wastes RAM.
+                file_size = os.path.getsize(log_file)
+                read_bytes = min(8 * 1024, file_size)
+                with open(log_file, "rb") as handle:
+                    handle.seek(file_size - read_bytes)
+                    tail = handle.read(read_bytes)
+                lines = tail.decode("utf-8", errors="ignore").splitlines()[-5:]
+                details["Last FFmpeg output"] = "\n".join(lines)
             except Exception:
                 pass
 

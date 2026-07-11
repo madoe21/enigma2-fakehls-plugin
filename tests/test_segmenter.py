@@ -103,6 +103,16 @@ class SegmenterTest(unittest.TestCase):
             self.assertTrue(os.path.exists(self.segmenter.segment_path(index)))
         self.assertEqual(len(self.segmenter.segments), 6)
 
+    def test_run_exits_promptly_after_writer_exit_notification(self):
+        # A known-dead ffmpeg means no writer will ever attach: run() must
+        # return without re-opening the pipe or waiting for the cleanup timer.
+        # Watchdog via thread join: a hang fails the assertion instead of
+        # stalling the whole test run.
+        self.segmenter.notify_writer_exited()
+        self.segmenter.start()
+        self.segmenter.join(timeout=2)
+        self.assertFalse(self.segmenter.is_alive())
+
     def test_playlist_updates_are_not_logged_as_errors(self):
         self._write_segments(4)
         self.assertEqual(self.logger.errors, [])

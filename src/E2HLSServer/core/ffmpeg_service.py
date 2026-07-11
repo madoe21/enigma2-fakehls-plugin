@@ -109,34 +109,6 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
     return cmd
 
 
-def start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings, on_exit=None, e2_user=None, e2_pass=None):
-    ffmpeg_log = os.path.join(log_dir, stream_id + "_ffmpeg.log")
-    cmd = build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=e2_user, e2_pass=e2_pass)
-
-    try:
-        with open(ffmpeg_log, "w", encoding="utf-8") as log_handle:
-            process = subprocess.Popen(
-                cmd,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-            )
-
-        print("[E2HLSServer] FFmpeg started for stream " + stream_id + " PID=" + str(process.pid) + " mode=copy")
-
-        if on_exit:
-            def monitor():
-                ret = process.wait()
-                on_exit(stream_id, ret, ffmpeg_log)
-
-            threading.Thread(target=monitor, daemon=True).start()
-
-        return process
-    except Exception as exc:
-        print("[E2HLSServer] ERROR starting FFmpeg: " + str(exc))
-        return None
-
-
 def async_start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings,
                        on_ready, on_exit=None, e2_user=None, e2_pass=None):
     """Start ffmpeg in a background thread so the caller doesn't block.

@@ -5,7 +5,9 @@ as **HLS** to any device (Roku, browser, VLC). Python, Twisted web server,
 ffmpeg copy-remux via named pipe (no temp-file bloat).
 
 ## Layout (portability-aware — Kodi port intended)
-- `src/config.py` — thin facade re-exporting the enigma2 platform config.
+- Root-level compat shims (`src/config.py`, `streammanager.py`, …) were
+  removed 2026-07-11 (bead 8fr) — only `src/plugin.py` remains as the
+  enigma2 entry-point wrapper.
 - `src/E2HLSServer/core/` — **platform-agnostic** logic: `stream_service.py`
   (stream lifecycle, `QUALITY_PRESETS`), `ffmpeg_service.py`. Keep Kodi-portable.
 - `src/E2HLSServer/platform/enigma2/` — **enigma2-specific** glue:

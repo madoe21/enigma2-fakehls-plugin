@@ -77,6 +77,18 @@ class PluginLoggerTest(unittest.TestCase):
         except Exception as exc:
             self.fail("logging raised: " + str(exc))
 
+    def test_ffmpeg_exit_reads_bounded_tail_of_ffmpeg_log(self):
+        ffmpeg_log = os.path.join(self.tmp_dir, "ffmpeg.log")
+        with open(ffmpeg_log, "w", encoding="utf-8") as handle:
+            for index in range(1000):
+                handle.write("line %d\n" % index)
+        self.logger.log_ffmpeg_exit("abcd1234", 1, ffmpeg_log)
+        content = self._log_contents()
+        # Only the last 5 lines of the ffmpeg log are kept.
+        self.assertIn("line 999", content)
+        self.assertIn("line 995", content)
+        self.assertNotIn("line 994", content)
+
     def test_debug_suppressed_without_debug_mode(self):
         self.logger.debug("hidden")
         self.assertNotIn("hidden", self._log_contents())

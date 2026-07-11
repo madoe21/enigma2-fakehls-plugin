@@ -179,6 +179,7 @@ class Segmenter(threading.Thread):
         self._seg_duration = seg_duration if seg_duration is not None else settings.segment_duration()
 
         self._stop_event = threading.Event()
+        self._writer_exited = threading.Event()
         self.segment_index = 0
         self.segments = []
         # RFC 8216 §6.2.1: EXT-X-TARGETDURATION must not change between
@@ -191,6 +192,11 @@ class Segmenter(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+
+    def notify_writer_exited(self):
+        """FFmpeg is gone: after draining the FIFO, run() exits instead of
+        re-opening the pipe and polling EOF until the cleanup timer fires."""
+        self._writer_exited.set()
 
     def join(self, timeout=None):
         """Wait for the segmentation loop to exit (pipe closed or stop signal)."""
@@ -225,7 +231,7 @@ class Segmenter(threading.Thread):
             pass
 
     def run(self):
-        while not self.stopped():
+        while not self.stopped() and not self._writer_exited.is_set():
             try:
                 self._run_segmentation()
             except Exception as exc:
@@ -274,9 +280,12 @@ class Segmenter(threading.Thread):
                 if not chunk:
                     # EOF on a FIFO means "no writer": before the first byte
                     # ffmpeg simply has not opened its end yet; afterwards
-                    # it exited.
+                    # it exited. A known-dead ffmpeg will never attach, so
+                    # stop waiting immediately in that case too.
                     if got_data:
                         self.logger.warning("Segmenter: pipe closed (FFmpeg ended)")
+                        break
+                    if self._writer_exited.is_set():
                         break
                     time.sleep(0.1)
                     continue
@@ -491,8 +500,8 @@ class StreamService(object):
             stream_id,
             log_dir,
             self.settings,
-            on_exit=self._on_ffmpeg_exit,
-            on_ready=self._on_ffmpeg_spawned,
+            on_exit=self._marshal(self._on_ffmpeg_exit),
+            on_ready=self._marshal(self._on_ffmpeg_spawned),
             e2_user=effective_params.get("e2_user"),
             e2_pass=effective_params.get("e2_pass"),
         )
@@ -504,14 +513,32 @@ class StreamService(object):
 
         return stream_id, True
 
+    def _marshal(self, fn):
+        """Wrap a callback so it runs on the reactor thread.
+
+        The ffmpeg spawn/exit callbacks fire on watcher threads; mutating
+        self.streams there races the reactor (cleanup timer, get_status
+        iteration). callFromThread serialises them onto the reactor.
+        """
+        def _on_reactor(*args):
+            self.reactor.callFromThread(fn, *args)
+        return _on_reactor
+
     def _on_ffmpeg_exit(self, stream_id, retcode, ffmpeg_log):
+        """Runs on the reactor thread (marshalled via _marshal)."""
         self.logger.log_ffmpeg_exit(stream_id, retcode, ffmpeg_log)
         info = self.streams.get(stream_id)
-        if info is not None and retcode != 0 and info.get("process") is not None:
+        if info is None:
+            return
+        if info.get("segmenter"):
+            # No writer will attach to the FIFO anymore — let the
+            # segmenter thread finish instead of polling until cleanup.
+            info["segmenter"].notify_writer_exited()
+        if retcode != 0 and info.get("process") is not None:
             info["crash_count"] = info.get("crash_count", 0) + 1
 
     def _on_ffmpeg_spawned(self, stream_id, process, ffmpeg_log):
-        """Called from the ffmpeg background thread when the process is ready."""
+        """Runs on the reactor thread (marshalled via _marshal)."""
         info = self.streams.get(stream_id)
         if info is not None and info.get("process") is None:
             info["process"] = process
