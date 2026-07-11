@@ -7,6 +7,12 @@ import threading
 import time
 
 from .ffmpeg_service import build_stream_url, start_ffmpeg
+from .mpegts import (
+    TS_PACKET_SIZE,
+    find_keyframe_cut,
+    pcr_delta_seconds,
+    read_pcr_base,
+)
 
 QUALITY_PRESETS = {
     "hw_transcode": {"label": "Hardware-Transcode (Port 8002)", "seg_duration": 2},
@@ -16,25 +22,155 @@ QUALITY_PRESETS = {
 }
 
 
-# MPEG transport stream packets are fixed-size; segments must cut on this grid.
-TS_PACKET_SIZE = 188
+class SegmentCutter(object):
+    """Pure segmentation state machine: TS bytes in, finished segments out.
+
+    Splits the stream at video keyframes so every segment starts decodable
+    (joins and recoveries show no artifacts), and derives durations from the
+    PCR media clock so EXTINF matches what players actually schedule on.
+    Wall-clock and packet-boundary fallbacks keep exotic streams alive.
+    Worst-case buffered data is KEYFRAME_WAIT_FACTOR target durations
+    (~12 MB at 8 Mbit/s on the 4 s preset).
+    """
+
+    # If no video keyframe shows up within this many target durations
+    # (stream without RAI marks), cut on a bare packet boundary like before.
+    KEYFRAME_WAIT_FACTOR = 3
+
+    def __init__(self, seg_duration, clock=time.time, logger=None):
+        self._seg_duration = seg_duration
+        self._clock = clock
+        self._logger = logger
+        self._buffer = bytearray()
+        self._scan_pos = 0
+        self._synced = False
+        self._segment_start = None  # set on first byte, not at construction
+        self._previous_cut_pcr = None
+        self._warned_no_keyframes = False
+
+    def feed(self, chunk):
+        """Consume stream bytes; return a list of finished (data, duration)."""
+        self._buffer.extend(chunk)
+        now = self._clock()
+        if self._segment_start is None:
+            # The give-up clock must start at the first byte: ffmpeg needs
+            # seconds for connect/probe before any output exists, and that
+            # wait must not eat the keyframe-search window.
+            self._segment_start = now
+        if not self._synced:
+            self._try_sync(now)
+            return []
+        return self._try_cut(now)
+
+    def flush(self):
+        """Return whatever is still buffered as the final segment."""
+        if not self._buffer:
+            return []
+        if self._segment_start is not None:
+            duration = max(0.0, self._clock() - self._segment_start)
+        else:
+            duration = self._seg_duration
+        data = bytes(self._buffer)
+        self._buffer = bytearray()
+        return [(data, duration)]
+
+    def _aligned_end(self):
+        return len(self._buffer) - (len(self._buffer) % TS_PACKET_SIZE)
+
+    def _warn(self, message):
+        if self._logger is not None and not self._warned_no_keyframes:
+            self._warned_no_keyframes = True
+            self._logger.warning(message)
+
+    def _try_sync(self, now):
+        # Drop everything before the first video keyframe: a segment 0 that
+        # starts mid-GOP decodes as garbage on every player.
+        cut, self._scan_pos = find_keyframe_cut(self._buffer, self._scan_pos)
+        if cut is not None:
+            del self._buffer[:cut]
+            self._scan_pos = TS_PACKET_SIZE
+            self._synced = True
+            self._segment_start = now
+            self._previous_cut_pcr = read_pcr_base(self._buffer[:TS_PACKET_SIZE])
+        elif now - self._segment_start >= self._seg_duration * self.KEYFRAME_WAIT_FACTOR:
+            self._warn("SegmentCutter: no video keyframe marks in stream, using packet-boundary cuts")
+            self._synced = True
+            self._segment_start = now
+
+    def _try_cut(self, now):
+        elapsed = now - self._segment_start
+        if elapsed < self._seg_duration or len(self._buffer) < TS_PACKET_SIZE:
+            # Skip keyframes arriving before the duration gate: the cut must
+            # be the first keyframe AFTER the target duration, or segments
+            # shrink to one GOP and the buffer grows without bound.
+            self._scan_pos = self._aligned_end()
+            return []
+
+        cut, self._scan_pos = find_keyframe_cut(self._buffer, self._scan_pos)
+        if cut == 0:
+            # Buffer already starts on a keyframe (fresh after a forced
+            # cut): look for the next one instead of cutting nothing.
+            self._scan_pos = TS_PACKET_SIZE
+            if self._previous_cut_pcr is None:
+                self._previous_cut_pcr = read_pcr_base(self._buffer[:TS_PACKET_SIZE])
+            return []
+        if cut is not None:
+            cut_pcr = read_pcr_base(self._buffer[cut:cut + TS_PACKET_SIZE])
+            duration = self._segment_duration_from_pcr(self._previous_cut_pcr, cut_pcr, elapsed)
+            segment = bytes(self._buffer[:cut])
+            del self._buffer[:cut]
+            self._scan_pos = TS_PACKET_SIZE
+            self._previous_cut_pcr = cut_pcr
+            self._segment_start = now
+            return [(segment, duration)]
+
+        if elapsed >= self._seg_duration * self.KEYFRAME_WAIT_FACTOR:
+            # Stream carries no random-access marks (or a huge GOP): fall
+            # back to a bare TS-packet-boundary cut to keep the stream going.
+            self._warn("SegmentCutter: no video keyframe found, forcing packet-boundary cut")
+            forced_cut = self._aligned_end()
+            if forced_cut > 0:
+                segment = bytes(self._buffer[:forced_cut])
+                del self._buffer[:forced_cut]
+                self._scan_pos = 0
+                self._previous_cut_pcr = None
+                self._segment_start = now
+                return [(segment, elapsed)]
+        return []
+
+    def _segment_duration_from_pcr(self, previous_pcr, cut_pcr, wall_elapsed):
+        """Media-time duration between two cuts; wall clock when PCR is unusable."""
+        if previous_pcr is None or cut_pcr is None:
+            return wall_elapsed
+        duration = pcr_delta_seconds(previous_pcr, cut_pcr)
+        # A PCR discontinuity (channel switch upstream, encoder restart) can
+        # yield an absurd span; the wall clock is the safer estimate then.
+        if not 0.2 <= duration <= self._seg_duration * 4:
+            return wall_elapsed
+        return duration
 
 
 class Segmenter(threading.Thread):
     PIPE_READ_SIZE = 65536
+    # Default FIFO capacity (64 KB) is ~65 ms of an 8 Mbit/s TS: any stall in
+    # this thread back-pressures ffmpeg and, via TCP, the tuner stream itself,
+    # which shows up as picture artifacts. 1 MB buys ~1 s of slack.
+    PIPE_BUFFER_BYTES = 1 << 20
 
-    def __init__(self, stream_id, settings, logger, local_ip_provider, seg_duration=None):
+    def __init__(self, stream_id, settings, logger, seg_duration=None):
         threading.Thread.__init__(self)
         self.stream_id = stream_id
         self.settings = settings
         self.logger = logger
-        self.local_ip_provider = local_ip_provider
         self.daemon = True
         self._seg_duration = seg_duration if seg_duration is not None else settings.segment_duration()
 
         self._stop_event = threading.Event()
         self.segment_index = 0
         self.segments = []
+        # RFC 8216 §6.2.1: EXT-X-TARGETDURATION must not change between
+        # reloads — keep a never-decreasing value instead of the window max.
+        self._target_duration = int(self._seg_duration) + 1
 
         self.hls_dir = settings.hls_dir()
         self.pipe_path = os.path.join(self.hls_dir, stream_id + "_pipe")
@@ -52,11 +188,12 @@ class Segmenter(threading.Thread):
         # live-playlist reloads by URI and stalls on recycled names.
         return os.path.join(self.hls_dir, self.stream_id + "_seg%05d.ts" % index)
 
-    def segment_url(self, index):
-        ip_addr = self.local_ip_provider()
-        port = self.settings.http_port()
-        return ("http://" + ip_addr + ":" + str(port) + "/hls/"
-                + self.stream_id + "_seg%05d.ts" % index)
+    def segment_uri(self, index):
+        # Relative URI — playlist and segments live in the same /hls/ path.
+        # Absolute URLs cost an `ip addr` subprocess per playlist line (12
+        # fork/execs every cut on a weak STB CPU) and broke access through
+        # any interface other than the guessed one.
+        return self.stream_id + "_seg%05d.ts" % index
 
     def create_pipe(self):
         if os.path.exists(self.pipe_path):
@@ -78,16 +215,28 @@ class Segmenter(threading.Thread):
                 self.logger.error("Segmenter loop error for " + self.stream_id + ": " + str(exc), exc_info=True)
                 time.sleep(2)
 
+    def _grow_pipe_buffer(self, pipe_file):
+        try:
+            import fcntl
+            setpipe_sz = getattr(fcntl, "F_SETPIPE_SZ", 1031)
+            fcntl.fcntl(pipe_file.fileno(), setpipe_sz, self.PIPE_BUFFER_BYTES)
+        except Exception as exc:
+            # Without the bigger FIFO any write stall back-pressures ffmpeg
+            # again — worth surfacing, the stream still works.
+            self.logger.warning("Segmenter: could not grow pipe buffer: " + str(exc))
+
     def _run_segmentation(self):
         try:
-            pipe_fd = open(self.pipe_path, "rb")
+            # Unbuffered: BufferedReader.read(n) blocks until n bytes arrive,
+            # a raw read returns whatever the FIFO has right now.
+            pipe_fd = open(self.pipe_path, "rb", buffering=0)
         except Exception as exc:
             self.logger.error("Segmenter: failed to open pipe: " + str(exc))
             time.sleep(1)
             return
 
-        buffer_data = bytearray()
-        segment_start = time.time()
+        self._grow_pipe_buffer(pipe_fd)
+        cutter = SegmentCutter(self._seg_duration, logger=self.logger)
 
         try:
             while not self.stopped():
@@ -95,18 +244,8 @@ class Segmenter(threading.Thread):
                 if not chunk:
                     self.logger.warning("Segmenter: pipe closed (FFmpeg ended)")
                     break
-
-                buffer_data.extend(chunk)
-                now = time.time()
-                if now - segment_start >= self._seg_duration and len(buffer_data) >= TS_PACKET_SIZE:
-                    # Cut on a TS packet boundary; a segment starting mid-packet
-                    # forces decoders to resync (VLC often refuses entirely).
-                    cut = len(buffer_data) - (len(buffer_data) % TS_PACKET_SIZE)
-                    self._write_segment(bytes(buffer_data[:cut]), now - segment_start)
-                    del buffer_data[:cut]
-                    segment_start = now
-
-                self._clean_old_segments()
+                for data, duration in cutter.feed(chunk):
+                    self._write_segment(data, duration)
         except Exception as exc:
             self.logger.error("Segmenter: pipe read error: " + str(exc), exc_info=True)
         finally:
@@ -115,8 +254,9 @@ class Segmenter(threading.Thread):
             except Exception:
                 pass
 
-            if buffer_data and not self.stopped():
-                self._write_segment(bytes(buffer_data), self._seg_duration)
+            if not self.stopped():
+                for data, duration in cutter.flush():
+                    self._write_segment(data, duration)
 
     def _write_segment(self, data, duration):
         if len(data) < 8 * 1024:
@@ -131,8 +271,10 @@ class Segmenter(threading.Thread):
 
             self.segments.append((self.segment_index, seg_path, created_at, duration))
             self.segment_index += 1
-            if self.segments:
-                self._update_playlist()
+            self._update_playlist()
+            # Once per segment is enough; running this per 64 KB chunk was
+            # pure overhead in the hot pipe-read loop.
+            self._clean_old_segments()
         except Exception as exc:
             self.logger.error("Error writing segment " + str(self.segment_index) + ": " + str(exc))
 
@@ -143,20 +285,21 @@ class Segmenter(threading.Thread):
             # Players schedule fetches from EXTINF; report measured durations,
             # not the nominal target, or the live edge drifts and stutters.
             max_duration = max(seg[3] for seg in active)
+            self._target_duration = max(self._target_duration, int(max_duration) + 1)
 
             content = "#EXTM3U\n"
             content += "#EXT-X-VERSION:3\n"
-            content += "#EXT-X-TARGETDURATION:" + str(int(max_duration) + 1) + "\n"
+            content += "#EXT-X-TARGETDURATION:" + str(self._target_duration) + "\n"
             content += "#EXT-X-MEDIA-SEQUENCE:" + str(first_seq) + "\n"
 
             for idx, _seg_path, _created_at, duration in active:
                 content += "#EXTINF:%.3f,\n" % duration
-                content += self.segment_url(idx) + "\n"
+                content += self.segment_uri(idx) + "\n"
 
             tmp_path = self.playlist + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as handle:
                 handle.write(content)
-            os.rename(tmp_path, self.playlist)
+            os.replace(tmp_path, self.playlist)
         except Exception as exc:
             self.logger.error("Error updating playlist: " + str(exc))
 
@@ -194,11 +337,10 @@ class Segmenter(threading.Thread):
 
 
 class StreamService(object):
-    def __init__(self, settings, logger, local_ip_provider, ensure_hls_dir, reactor):
+    def __init__(self, settings, logger, ensure_hls_dir, reactor):
         self.streams = {}
         self.settings = settings
         self.logger = logger
-        self.local_ip_provider = local_ip_provider
         self.ensure_hls_dir = ensure_hls_dir
         self.reactor = reactor
         self._cleanup_timer = None
@@ -283,7 +425,7 @@ class StreamService(object):
         log_dir = os.path.join(hls_dir, "logs")
         self.ensure_hls_dir(hls_dir)
 
-        segmenter = Segmenter(stream_id, self.settings, self.logger, self.local_ip_provider,
+        segmenter = Segmenter(stream_id, self.settings, self.logger,
                               seg_duration=preset["seg_duration"])
         segmenter.create_pipe()
 

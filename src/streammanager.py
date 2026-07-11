@@ -4,7 +4,7 @@ from __future__ import absolute_import
 from twisted.internet import reactor
 
 from .E2HLSServer.core.stream_service import StreamService
-from .E2HLSServer.platform.enigma2.config import Enigma2Settings, ensure_hls_dir, get_local_ip
+from .E2HLSServer.platform.enigma2.config import Enigma2Settings, ensure_hls_dir
 
 
 class StreamManager(StreamService):
@@ -13,7 +13,6 @@ class StreamManager(StreamService):
             self,
             settings=Enigma2Settings(),
             logger=logger,
-            local_ip_provider=get_local_ip,
             ensure_hls_dir=ensure_hls_dir,
             reactor=reactor,
         )

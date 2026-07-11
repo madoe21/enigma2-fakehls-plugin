@@ -8,6 +8,7 @@ import re
 import urllib.parse
 
 from twisted.internet import reactor
+from twisted.web import static
 from twisted.web.resource import Resource
 from twisted.web.server import NOT_DONE_YET, Site
 
@@ -552,6 +553,29 @@ class HlsRoot(Resource):
             request.setResponseCode(404)
             return b""
 
+        if filename.endswith(".ts"):
+            # Segments are 2–5 MB. Reading them inline blocks the reactor —
+            # which is enigma2's main loop (GUI + tuner stream) — for the
+            # whole read. static.File streams via a producer instead, in
+            # chunks, only when the socket can take more.
+            try:
+                client_ip = request.getClientIP()
+                resource = static.File(filepath, defaultType="video/MP2T")
+                resource.contentTypes = {".ts": "video/MP2T"}
+                resource.isLeaf = True
+                # Log when the response is done — static.File may answer
+                # 206 (Range) or 304, and only then are code/size real.
+                finished = request.notifyFinish()
+                finished.addCallback(
+                    lambda _: self.logger.log_request(
+                        "GET", "/hls/" + filename, client_ip, request.code, request.sentLength))
+                finished.addErrback(lambda _: None)
+                return resource.render_GET(request)
+            except Exception as exc:
+                self.logger.error("Error serving HLS segment " + filename + ": " + str(exc))
+                request.setResponseCode(500)
+                return b""
+
         try:
             with open(filepath, "rb") as handle:
                 data = handle.read()
@@ -563,8 +587,6 @@ class HlsRoot(Resource):
         if filename.endswith(".m3u8"):
             request.setHeader(b"Content-Type", b"application/vnd.apple.mpegurl")
             request.setHeader(b"Cache-Control", b"no-cache, no-store")
-        elif filename.endswith(".ts"):
-            request.setHeader(b"Content-Type", b"video/MP2T")
 
         self.logger.log_request("GET", "/hls/" + filename, request.getClientIP(), 200, len(data))
         return data
