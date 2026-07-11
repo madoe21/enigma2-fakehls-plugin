@@ -158,7 +158,7 @@ def async_start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings,
                     stdin=subprocess.DEVNULL,
                 )
             print("[E2HLSServer] FFmpeg started for stream " + stream_id + " PID=" + str(process.pid) + " mode=copy")
-            on_ready(process, ffmpeg_log)
+            on_ready(stream_id, process, ffmpeg_log)
 
             if on_exit:
                 def monitor():
@@ -168,6 +168,6 @@ def async_start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings,
                 threading.Thread(target=monitor, daemon=True, name="ffmpeg-exit-" + stream_id).start()
         except Exception as exc:
             print("[E2HLSServer] ERROR starting FFmpeg: " + str(exc))
-            on_ready(None, ffmpeg_log)
+            on_ready(stream_id, None, ffmpeg_log)
 
     threading.Thread(target=_spawn, daemon=True, name="ffmpeg-" + stream_id).start()

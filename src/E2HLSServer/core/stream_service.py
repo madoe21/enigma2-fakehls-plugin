@@ -462,6 +462,11 @@ class StreamService(object):
             e2_pass=effective_params.get("e2_pass"),
         )
 
+        # The segmenter runs in its own thread and consumes the pipe until
+        # ffmpeg exits.  It must be started *before* returning so the
+        # playlist file exists when the first client polls for it.
+        segmenter.start()
+
         return stream_id, True
 
     def _on_ffmpeg_exit(self, stream_id, retcode, ffmpeg_log):
@@ -491,10 +496,12 @@ class StreamService(object):
         if info.get("segmenter"):
             info["segmenter"].stop()
             if delete_files:
-                # Join before cleanup to close the write/delete race (708):
-                # the segmenter may still be writing its final segment.
-                info["segmenter"].join(timeout=3)
-                info["segmenter"].cleanup_all()
+                # The segmenter may have been started (normal case) or not
+                # (early cleanup before it had a chance to start).
+                seg = info["segmenter"]
+                if seg.is_alive():
+                    seg.join(timeout=3)
+                seg.cleanup_all()
 
         if info.get("process"):
             try:

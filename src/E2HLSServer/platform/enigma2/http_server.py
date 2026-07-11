@@ -342,6 +342,10 @@ class HlsRoot(Resource):
         self._name_cache = {}
 
     def getChild(self, name, request):
+        # When the path contains colons (e.g. service refs like 1:0:19:EF11:…
+        # or ports like :8003), Twisted splits on ':' for virtual hosts, so
+        # render_GET never sees the full path. Force the root to handle
+        # everything so our regex can match the full ref.
         return self
 
     def render_GET(self, request):
