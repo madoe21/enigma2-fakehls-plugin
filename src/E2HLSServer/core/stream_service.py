@@ -3,10 +3,11 @@ from __future__ import absolute_import
 
 import hashlib
 import os
+import socket
 import threading
 import time
 
-from .ffmpeg_service import build_stream_url, mask_credentials, start_ffmpeg
+from .ffmpeg_service import async_start_ffmpeg, build_stream_url, mask_credentials, start_ffmpeg
 from .mpegts import (
     TS_PACKET_SIZE,
     find_keyframe_cut,
@@ -179,6 +180,10 @@ class Segmenter(threading.Thread):
     def stop(self):
         self._stop_event.set()
 
+    def join(self, timeout=None):
+        """Wait for the segmentation loop to exit (pipe closed or stop signal)."""
+        threading.Thread.join(self, timeout)
+
     def stopped(self):
         return self._stop_event.is_set()
 
@@ -344,6 +349,7 @@ class StreamService(object):
         self.ensure_hls_dir = ensure_hls_dir
         self.reactor = reactor
         self._cleanup_timer = None
+        self._local_ip = None  # cached via get_local_ip (avoids subprocess per call)
 
         self._ensure_directories()
         self._start_cleanup_timer()
@@ -430,46 +436,51 @@ class StreamService(object):
         segmenter.create_pipe()
 
         stream_url = build_stream_url(effective_params, self.settings)
-        # Which source the input comes from (stream port vs relay) is the
-        # first question in every dropout report — log it per stream.
         self.logger.info("Stream " + stream_id + " input: " + mask_credentials(stream_url))
-        process = start_ffmpeg(
-            stream_url,
-            segmenter.pipe_path,
-            stream_id,
-            log_dir,
-            self.settings,
-            on_exit=self._on_ffmpeg_exit,
-            e2_user=effective_params.get("e2_user"),
-            e2_pass=effective_params.get("e2_pass"),
-        )
 
-        if process is None:
-            self.logger.error("Failed to start FFmpeg for stream " + stream_id)
-            segmenter.remove_pipe()
-            return None, False
-
-        segmenter.start()
-
-        self.streams[stream_id] = {
+        info = {
             "id": stream_id,
             "params": params,
             "stream_url": stream_url,
-            "process": process,
             "segmenter": segmenter,
             "started": time.time(),
             "last_accessed": time.time(),
             "access_count": 1,
             "crash_count": 0,
         }
+        self.streams[stream_id] = info
 
-        self.logger.info("Stream " + stream_id + " started (mode=copy)")
+        async_start_ffmpeg(
+            stream_url,
+            segmenter.pipe_path,
+            stream_id,
+            log_dir,
+            self.settings,
+            on_exit=self._on_ffmpeg_exit,
+            on_ready=self._on_ffmpeg_spawned,
+            e2_user=effective_params.get("e2_user"),
+            e2_pass=effective_params.get("e2_pass"),
+        )
+
         return stream_id, True
 
     def _on_ffmpeg_exit(self, stream_id, retcode, ffmpeg_log):
         self.logger.log_ffmpeg_exit(stream_id, retcode, ffmpeg_log)
-        if stream_id in self.streams and retcode != 0:
-            self.streams[stream_id]["crash_count"] = self.streams[stream_id].get("crash_count", 0) + 1
+        info = self.streams.get(stream_id)
+        if info is not None and retcode != 0 and info.get("process") is not None:
+            info["crash_count"] = info.get("crash_count", 0) + 1
+
+    def _on_ffmpeg_spawned(self, stream_id, process, ffmpeg_log):
+        """Called from the ffmpeg background thread when the process is ready."""
+        info = self.streams.get(stream_id)
+        if info is not None and info.get("process") is None:
+            info["process"] = process
+            if process is not None:
+                self.logger.info("Stream " + stream_id + " started (mode=copy)")
+            else:
+                self.logger.error("Failed to start FFmpeg for stream " + stream_id)
+                # Clean up — the segmenter is still running but ffmpeg failed.
+                self._stop_stream(stream_id, delete_files=True)
 
     def _stop_stream(self, stream_id, delete_files=False):
         if stream_id not in self.streams:
@@ -480,14 +491,23 @@ class StreamService(object):
         if info.get("segmenter"):
             info["segmenter"].stop()
             if delete_files:
+                # Join before cleanup to close the write/delete race (708):
+                # the segmenter may still be writing its final segment.
+                info["segmenter"].join(timeout=3)
                 info["segmenter"].cleanup_all()
 
         if info.get("process"):
-            info["process"].terminate()
+            try:
+                info["process"].terminate()
+            except Exception:
+                pass
             try:
                 info["process"].wait(timeout=2)
             except Exception:
-                info["process"].kill()
+                try:
+                    info["process"].kill()
+                except Exception:
+                    pass
 
         if delete_files:
             self._cleanup_stream_files(stream_id)
@@ -500,19 +520,11 @@ class StreamService(object):
             self._stop_stream(stream_id, delete_files=True)
 
     def _cleanup_stream_files(self, stream_id):
-        hls_dir = self.settings.hls_dir()
-        try:
-            if os.path.exists(hls_dir):
-                for name in os.listdir(hls_dir):
-                    if name.startswith(stream_id):
-                        path = os.path.join(hls_dir, name)
-                        if os.path.isfile(path):
-                            os.unlink(path)
-                playlist = os.path.join(hls_dir, "live_" + stream_id + ".m3u8")
-                if os.path.exists(playlist):
-                    os.unlink(playlist)
-        except Exception as exc:
-            self.logger.error("Error cleaning up files for " + stream_id + ": " + str(exc))
+        # Use the segmenter's own bookkeeping instead of scanning the
+        # directory — avoids a blocking os.listdir on the reactor thread.
+        info = self.streams.get(stream_id)
+        if info and info.get("segmenter"):
+            info["segmenter"].cleanup_all()
 
     def cleanup_old_session_files(self):
         hls_dir = self.settings.hls_dir()
@@ -532,6 +544,16 @@ class StreamService(object):
 
     def get_status(self):
         hls_dir = self.settings.hls_dir()
+        if self._local_ip is None:
+            try:
+                from twisted.internet import address
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                self._local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                self._local_ip = "0.0.0.0"
+
         status = {}
 
         for stream_id, info in self.streams.items():
