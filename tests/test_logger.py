@@ -89,6 +89,21 @@ class PluginLoggerTest(unittest.TestCase):
         self.assertIn("line 995", content)
         self.assertNotIn("line 994", content)
 
+    def test_error_outside_except_block_has_no_traceback_noise(self):
+        self.logger.error("plain failure")
+        content = self._log_contents()
+        self.assertIn("plain failure", content)
+        self.assertNotIn("NoneType: None", content)
+
+    def test_error_inside_except_block_includes_traceback(self):
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            self.logger.error("caught failure")
+        content = self._log_contents()
+        self.assertIn("caught failure", content)
+        self.assertIn("ValueError: boom", content)
+
     def test_debug_suppressed_without_debug_mode(self):
         self.logger.debug("hidden")
         self.assertNotIn("hidden", self._log_contents())

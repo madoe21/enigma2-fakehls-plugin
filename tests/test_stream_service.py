@@ -138,6 +138,42 @@ class StreamServiceTest(unittest.TestCase):
         service = self._service()
         service._on_ffmpeg_exit("gone", 1, None)  # must not raise
 
+    def _stream_entry(self, segmenter, process=None):
+        return {
+            "params": {"ref": "1:0:1"},
+            "started": time.time(),
+            "access_count": 1,
+            "crash_count": 0,
+            "process": process,
+            "segmenter": segmenter,
+        }
+
+    def test_stale_ffmpeg_exit_is_ignored_after_stream_id_reuse(self):
+        # stream_id is a deterministic hash: a reaped stream can be
+        # re-created before an old marshalled callback dequeues.
+        service = self._service()
+        old_segmenter = FakeSegmenter(segment_count=0)
+        new_segmenter = FakeSegmenter(segment_count=0)
+        service.streams["abcd1234"] = self._stream_entry(new_segmenter, process=object())
+        service._on_ffmpeg_exit("abcd1234", 1, None, expected_segmenter=old_segmenter)
+        self.assertFalse(new_segmenter.writer_exit_notified)
+        self.assertEqual(service.streams["abcd1234"]["crash_count"], 0)
+
+    def test_stale_ffmpeg_spawn_terminates_orphan_process(self):
+        class FakeProcess(object):
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+        service = self._service()
+        orphan = FakeProcess()
+        # Stream gone entirely — nobody else would ever reap this process.
+        service._on_ffmpeg_spawned("gone", orphan, None,
+                                   expected_segmenter=FakeSegmenter(0))
+        self.assertTrue(orphan.terminated)
+
     def test_clean_ffmpeg_exit_notifies_without_crash_count(self):
         service = self._service()
         segmenter = FakeSegmenter(segment_count=0)

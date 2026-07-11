@@ -176,8 +176,12 @@ deploy:
 	@echo "========================================="
 	@echo " Fast Deploy to $(BOX_USER)@$(BOX_HOST)"
 	@echo "========================================="
-	@echo "Creating plugin directory on box..."
-	@$(BOX_SSH) "mkdir -p $(BOX_PLUGIN_DIR)"
+	@echo "Wiping plugin directory on box (force clean install)..."
+	@# Stale .py files from removed modules keep importing otherwise —
+	@# scp never deletes, so start from an empty directory every deploy.
+	@# Guard: an empty PLUGIN_NAME would make the rm hit Extensions/ itself.
+	@test -n "$(PLUGIN_NAME)" || { echo "PLUGIN_NAME is empty — abort"; exit 1; }
+	@$(BOX_SSH) "rm -rf $(BOX_PLUGIN_DIR) && mkdir -p $(BOX_PLUGIN_DIR)"
 
 	@echo "Copying source files..."
 	@$(BOX_SCP) $(SRC_DIR)/*.py   $(BOX_USER)@$(BOX_HOST):$(BOX_PLUGIN_DIR)/
@@ -195,11 +199,6 @@ deploy:
 
 	@echo "Removing old FakeE2HLSServer if present..."
 	@$(BOX_SSH) "rm -rf /usr/lib/enigma2/python/Plugins/Extensions/FakeE2HLSServer" 2>/dev/null || true
-
-	@echo "Clearing Python cache on box..."
-	@$(BOX_SSH) "find $(BOX_PLUGIN_DIR) -name '*.pyc' -delete; \
-	             find $(BOX_PLUGIN_DIR) -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
-	             true"
 
 	@echo "Restarting Enigma2 (clean runlevel restart)..."
 	@# killall -HUP makes the inittab respawn wrapper misread the exit code

@@ -110,12 +110,14 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
 
 
 def async_start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings,
-                       on_ready, on_exit=None, e2_user=None, e2_pass=None):
+                       on_ready, on_exit=None, e2_user=None, e2_pass=None,
+                       logger=None):
     """Start ffmpeg in a background thread so the caller doesn't block.
 
     Invokes ``on_ready(process, ffmpeg_log)`` when ffmpeg is ready (or
     fails), with ``process`` being *None* on failure.  Optionally calls
     ``on_exit(stream_id, retcode, ffmpeg_log)`` when the process terminates.
+    Lifecycle messages go to ``logger`` (info/error) when provided.
     """
     ffmpeg_log = os.path.join(log_dir, stream_id + "_ffmpeg.log")
     cmd = build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=e2_user, e2_pass=e2_pass)
@@ -129,7 +131,9 @@ def async_start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                 )
-            print("[E2HLSServer] FFmpeg started for stream " + stream_id + " PID=" + str(process.pid) + " mode=copy")
+            if logger is not None:
+                logger.info("FFmpeg started for stream " + stream_id
+                            + " (PID " + str(process.pid) + ", mode=copy)")
             on_ready(stream_id, process, ffmpeg_log)
 
             if on_exit:
@@ -139,7 +143,8 @@ def async_start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings,
 
                 threading.Thread(target=monitor, daemon=True, name="ffmpeg-exit-" + stream_id).start()
         except Exception as exc:
-            print("[E2HLSServer] ERROR starting FFmpeg: " + str(exc))
+            if logger is not None:
+                logger.error("Error starting FFmpeg for stream " + stream_id + ": " + str(exc))
             on_ready(stream_id, None, ffmpeg_log)
 
     threading.Thread(target=_spawn, daemon=True, name="ffmpeg-" + stream_id).start()

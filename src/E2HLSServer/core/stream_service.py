@@ -494,16 +494,22 @@ class StreamService(object):
         }
         self.streams[stream_id] = info
 
+        # The lambdas bind this registration's segmenter so a late callback
+        # from a previous life of the same stream_id (deterministic MD5) can
+        # be recognised as stale and ignored.
         async_start_ffmpeg(
             stream_url,
             segmenter.pipe_path,
             stream_id,
             log_dir,
             self.settings,
-            on_exit=self._marshal(self._on_ffmpeg_exit),
-            on_ready=self._marshal(self._on_ffmpeg_spawned),
+            on_exit=self._marshal(
+                lambda sid, rc, log: self._on_ffmpeg_exit(sid, rc, log, segmenter)),
+            on_ready=self._marshal(
+                lambda sid, proc, log: self._on_ffmpeg_spawned(sid, proc, log, segmenter)),
             e2_user=effective_params.get("e2_user"),
             e2_pass=effective_params.get("e2_pass"),
+            logger=self.logger,
         )
 
         # The segmenter runs in its own thread and consumes the pipe until
@@ -524,10 +530,24 @@ class StreamService(object):
             self.reactor.callFromThread(fn, *args)
         return _on_reactor
 
-    def _on_ffmpeg_exit(self, stream_id, retcode, ffmpeg_log):
+    def _stream_info_for(self, stream_id, expected_segmenter):
+        """Current stream entry, or None when the callback is stale.
+
+        stream_id is a deterministic hash of the request params, so a
+        reaped-and-recreated stream reuses the id; the segmenter identity
+        captured at callback registration tells the two lives apart.
+        """
+        info = self.streams.get(stream_id)
+        if info is None:
+            return None
+        if expected_segmenter is not None and info.get("segmenter") is not expected_segmenter:
+            return None
+        return info
+
+    def _on_ffmpeg_exit(self, stream_id, retcode, ffmpeg_log, expected_segmenter=None):
         """Runs on the reactor thread (marshalled via _marshal)."""
         self.logger.log_ffmpeg_exit(stream_id, retcode, ffmpeg_log)
-        info = self.streams.get(stream_id)
+        info = self._stream_info_for(stream_id, expected_segmenter)
         if info is None:
             return
         if info.get("segmenter"):
@@ -537,10 +557,19 @@ class StreamService(object):
         if retcode != 0 and info.get("process") is not None:
             info["crash_count"] = info.get("crash_count", 0) + 1
 
-    def _on_ffmpeg_spawned(self, stream_id, process, ffmpeg_log):
+    def _on_ffmpeg_spawned(self, stream_id, process, ffmpeg_log, expected_segmenter=None):
         """Runs on the reactor thread (marshalled via _marshal)."""
-        info = self.streams.get(stream_id)
-        if info is not None and info.get("process") is None:
+        info = self._stream_info_for(stream_id, expected_segmenter)
+        if info is None:
+            # Stale registration: the stream this ffmpeg was spawned for is
+            # gone, so nobody else will ever terminate the process.
+            if process is not None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            return
+        if info.get("process") is None:
             info["process"] = process
             if process is not None:
                 self.logger.info("Stream " + stream_id + " started (mode=copy)")

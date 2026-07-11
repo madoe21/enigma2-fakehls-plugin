@@ -121,7 +121,10 @@ class PluginLogger(object):
             return
 
         log_line = self._format_message(level_name, message, details)
-        if exc_info and level >= self.ERROR:
+        # Only append a traceback when an exception is actually active —
+        # format_exc() outside an except block yields a useless
+        # "NoneType: None" line.
+        if exc_info and level >= self.ERROR and sys.exc_info()[0] is not None:
             log_line += "\n" + traceback.format_exc()
 
         self._write_raw_log(log_line)
