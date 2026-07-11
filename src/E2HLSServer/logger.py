@@ -68,6 +68,7 @@ class PluginLogger(object):
 
     def _write_raw_log(self, message):
         with self._lock:
+            self._check_rotate()
             if self._handle is None:
                 self._open_log()
             if self._handle is None:
@@ -75,10 +76,29 @@ class PluginLogger(object):
                 return
             try:
                 self._handle.write(message + "\n")
-                if self._handle.tell() > self.MAX_LOG_BYTES:
-                    self._rotate_locked()
             except Exception:
-                print("[" + self.name + "] " + message)
+                # Reopen once (handle may be stale after rotation/unlink);
+                # if the write still fails (e.g. tmpfs full) fall back to
+                # stdout — logging must never raise into callers.
+                self._handle = None
+                self._open_log()
+                try:
+                    if self._handle is None:
+                        raise IOError("log file unavailable")
+                    self._handle.write(message + "\n")
+                except Exception:
+                    self._handle = None
+                    print("[" + self.name + "] " + message)
+
+    def _check_rotate(self):
+        """Rotate the log if it exceeds MAX_LOG_BYTES (caller holds lock)."""
+        if self._handle is None:
+            return
+        try:
+            if self._handle.tell() > self.MAX_LOG_BYTES:
+                self._rotate_locked()
+        except Exception:
+            self._handle = None
 
     def _format_message(self, level, message, details=None):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]

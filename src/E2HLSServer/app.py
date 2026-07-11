@@ -7,7 +7,12 @@ from twisted.internet import reactor
 
 from .core.stream_service import StreamService
 from .logger import PluginLogger
-from .platform.enigma2.config import Enigma2Settings, ensure_hls_dir, get_local_ip
+from .platform.enigma2.config import (
+    Enigma2Settings,
+    ensure_hls_dir,
+    get_local_ip,
+    read_e2_credentials,
+)
 from .platform.enigma2.http_server import HlsHttpServer
 
 
@@ -27,6 +32,7 @@ class AppContext(object):
             logger=self.logger,
             ensure_hls_dir=ensure_hls_dir,
             reactor=reactor,
+            credentials_provider=read_e2_credentials,
         )
 
         self.server = HlsHttpServer(

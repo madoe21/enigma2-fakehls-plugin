@@ -629,9 +629,17 @@ class HlsRoot(Resource):
         log_file = os.path.join(self.settings.hls_dir(), "logs", "plugin.log")
         try:
             if os.path.exists(log_file):
-                with open(log_file, "r", encoding="utf-8", errors="ignore") as handle:
-                    lines = handle.readlines()[-100:]
-                content = "".join(lines)
+                file_size = os.path.getsize(log_file)
+                # Read only the last 64 KB (covers ~100 lines) instead of
+                # the whole file — the log is size-capped but still large.
+                # Binary mode: seeking to an arbitrary offset is undefined
+                # on text streams; decode after the bounded read instead.
+                read_bytes = min(64 * 1024, file_size)
+                with open(log_file, "rb") as handle:
+                    handle.seek(file_size - read_bytes)
+                    tail = handle.read()
+                lines = tail.decode("utf-8", errors="ignore").splitlines()[-100:]
+                content = "\n".join(lines)
                 self.logger.log_request("GET", "/logs", request.getClientIP(), 200)
                 return content.encode()
             return b"No logs available"

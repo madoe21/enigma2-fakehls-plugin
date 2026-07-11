@@ -87,12 +87,21 @@ class SegmenterTest(unittest.TestCase):
 
     def test_old_segment_files_are_deleted(self):
         self._write_segments(6)
-        # keep = playlist_size + 1 = 4 newest files
+        # keep = 2 * playlist_size = 6 newest files (RFC 8216 §6.2.2)
+        # All 6 segments are kept since total == keep, so none are deleted.
+        self.assertEqual(len(self.segmenter.segments), 6)
+        for index in range(6):
+            self.assertTrue(os.path.exists(self.segmenter.segment_path(index)))
+
+    def test_segment_retention_exceeds_playlist_size(self):
+        """RFC 8216 §6.2.2: keep segments beyond the playlist window."""
+        self._write_segments(8)
+        # keep = 2 * 3 = 6; segments 0,1 are cleaned, 2-7 remain
         self.assertFalse(os.path.exists(self.segmenter.segment_path(0)))
         self.assertFalse(os.path.exists(self.segmenter.segment_path(1)))
-        for index in range(2, 6):
+        for index in range(2, 8):
             self.assertTrue(os.path.exists(self.segmenter.segment_path(index)))
-        self.assertEqual(len(self.segmenter.segments), 4)
+        self.assertEqual(len(self.segmenter.segments), 6)
 
     def test_playlist_updates_are_not_logged_as_errors(self):
         self._write_segments(4)

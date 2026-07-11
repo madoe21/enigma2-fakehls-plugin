@@ -5,6 +5,7 @@ import gettext
 import os
 import socket
 import subprocess
+import time
 
 from Components.Language import language
 from Components.config import (
@@ -88,8 +89,9 @@ def get_favicon_path():
 
 # Fallbacks when Enigma2 config is unavailable.
 DEFAULT_SEGMENT_DURATION = 2
-# 12 x 2s segments = 24s live window; gives the web player ~10s forward buffer
-# while keeping tmpfs usage bounded (playlist_size + 1 segment files, ~32 MB).
+# 12 x 2s segments = 24s live window; gives the web player ~10s forward buffer.
+# On-disk retention is 2 x playlist_size files (RFC 8216 §6.2.2 slack for slow
+# clients) — ~48s of stream, ~50-60 MB tmpfs per active stream at SD/HD rates.
 DEFAULT_PLAYLIST_SIZE = 12
 DEFAULT_SEGMENT_MAX_AGE = 30
 DEFAULT_CLEANUP_INTERVAL = 10
@@ -165,6 +167,14 @@ def ensure_hls_dir(hls_dir=None):
 	return True
 
 
+# The LAN IP of a set-top box changes ~never, but resolving it costs a
+# fork/exec ("ip -4 addr show") — cache it so status/player requests and
+# the GUI refresh do not fork per call. Failures are not cached, so a
+# box whose network comes up late recovers on the next call.
+_LOCAL_IP_TTL_SECONDS = 300
+_local_ip_cache = {"ip": None, "expires": 0.0}
+
+
 def get_local_ip():
 	try:
 		configured = config.plugins.e2hlsserver.bind_ip.value
@@ -172,6 +182,9 @@ def get_local_ip():
 			return configured
 	except Exception:
 		pass
+
+	if _local_ip_cache["ip"] and time.time() < _local_ip_cache["expires"]:
+		return _local_ip_cache["ip"]
 
 	try:
 		result = subprocess.check_output(
@@ -190,9 +203,9 @@ def get_local_ip():
 					if best_ip is None:
 						best_ip = ip_addr
 					continue
-				return ip_addr
+				return _cache_local_ip(ip_addr)
 		if best_ip:
-			return best_ip
+			return _cache_local_ip(best_ip)
 	except Exception:
 		pass
 
@@ -201,9 +214,15 @@ def get_local_ip():
 		sock.connect(("8.8.8.8", 80))
 		ip_addr = sock.getsockname()[0]
 		sock.close()
-		return ip_addr
+		return _cache_local_ip(ip_addr)
 	except Exception:
 		return "127.0.0.1"
+
+
+def _cache_local_ip(ip_addr):
+	_local_ip_cache["ip"] = ip_addr
+	_local_ip_cache["expires"] = time.time() + _LOCAL_IP_TTL_SECONDS
+	return ip_addr
 
 
 class Enigma2Settings(object):

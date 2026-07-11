@@ -3,11 +3,11 @@ from __future__ import absolute_import
 
 import hashlib
 import os
-import socket
+import select
 import threading
 import time
 
-from .ffmpeg_service import async_start_ffmpeg, build_stream_url, mask_credentials, start_ffmpeg
+from .ffmpeg_service import async_start_ffmpeg, build_stream_url, mask_credentials
 from .mpegts import (
     TS_PACKET_SIZE,
     find_keyframe_cut,
@@ -78,6 +78,20 @@ class SegmentCutter(object):
     def _aligned_end(self):
         return len(self._buffer) - (len(self._buffer) % TS_PACKET_SIZE)
 
+    def _extract_segment(self, cut):
+        """Copy buffer[:cut] once and drop it from the buffer.
+
+        A plain bytes(self._buffer[:cut]) copies the multi-MB segment twice
+        (bytearray slice, then bytes); slicing a memoryview is zero-copy, so
+        bytes() materialises exactly once. The view must be released before
+        del resizes the bytearray, or that raises BufferError.
+        """
+        view = memoryview(self._buffer)
+        segment = bytes(view[:cut])
+        view.release()
+        del self._buffer[:cut]
+        return segment
+
     def _warn(self, message):
         if self._logger is not None and not self._warned_no_keyframes:
             self._warned_no_keyframes = True
@@ -118,8 +132,7 @@ class SegmentCutter(object):
         if cut is not None:
             cut_pcr = read_pcr_base(self._buffer[cut:cut + TS_PACKET_SIZE])
             duration = self._segment_duration_from_pcr(self._previous_cut_pcr, cut_pcr, elapsed)
-            segment = bytes(self._buffer[:cut])
-            del self._buffer[:cut]
+            segment = self._extract_segment(cut)
             self._scan_pos = TS_PACKET_SIZE
             self._previous_cut_pcr = cut_pcr
             self._segment_start = now
@@ -131,8 +144,7 @@ class SegmentCutter(object):
             self._warn("SegmentCutter: no video keyframe found, forcing packet-boundary cut")
             forced_cut = self._aligned_end()
             if forced_cut > 0:
-                segment = bytes(self._buffer[:forced_cut])
-                del self._buffer[:forced_cut]
+                segment = self._extract_segment(forced_cut)
                 self._scan_pos = 0
                 self._previous_cut_pcr = None
                 self._segment_start = now
@@ -220,42 +232,60 @@ class Segmenter(threading.Thread):
                 self.logger.error("Segmenter loop error for " + self.stream_id + ": " + str(exc), exc_info=True)
                 time.sleep(2)
 
-    def _grow_pipe_buffer(self, pipe_file):
+    def _grow_pipe_buffer(self, pipe_fd):
         try:
             import fcntl
             setpipe_sz = getattr(fcntl, "F_SETPIPE_SZ", 1031)
-            fcntl.fcntl(pipe_file.fileno(), setpipe_sz, self.PIPE_BUFFER_BYTES)
+            fcntl.fcntl(pipe_fd, setpipe_sz, self.PIPE_BUFFER_BYTES)
         except Exception as exc:
             # Without the bigger FIFO any write stall back-pressures ffmpeg
             # again — worth surfacing, the stream still works.
             self.logger.warning("Segmenter: could not grow pipe buffer: " + str(exc))
 
     def _run_segmentation(self):
+        # O_NONBLOCK: a blocking open() would park this thread until ffmpeg
+        # opens the writer end — forever if the spawn failed (bad URL, auth
+        # error) — and stop() could never wake it. A non-blocking read-end
+        # open always succeeds; the EOF handling below covers the window
+        # before ffmpeg attaches.
         try:
-            # Unbuffered: BufferedReader.read(n) blocks until n bytes arrive,
-            # a raw read returns whatever the FIFO has right now.
-            pipe_fd = open(self.pipe_path, "rb", buffering=0)
-        except Exception as exc:
+            pipe_fd = os.open(self.pipe_path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
             self.logger.error("Segmenter: failed to open pipe: " + str(exc))
             time.sleep(1)
             return
 
         self._grow_pipe_buffer(pipe_fd)
         cutter = SegmentCutter(self._seg_duration, logger=self.logger)
+        got_data = False
 
         try:
             while not self.stopped():
-                chunk = pipe_fd.read(self.PIPE_READ_SIZE)
-                if not chunk:
-                    self.logger.warning("Segmenter: pipe closed (FFmpeg ended)")
+                try:
+                    chunk = os.read(pipe_fd, self.PIPE_READ_SIZE)
+                except BlockingIOError:
+                    # Writer attached but no data right now — wait, bounded
+                    # so stop() is honoured within a second.
+                    select.select([pipe_fd], [], [], 1.0)
+                    continue
+                except OSError as exc:
+                    self.logger.error("Segmenter: pipe read error: " + str(exc), exc_info=True)
                     break
+                if not chunk:
+                    # EOF on a FIFO means "no writer": before the first byte
+                    # ffmpeg simply has not opened its end yet; afterwards
+                    # it exited.
+                    if got_data:
+                        self.logger.warning("Segmenter: pipe closed (FFmpeg ended)")
+                        break
+                    time.sleep(0.1)
+                    continue
+                got_data = True
                 for data, duration in cutter.feed(chunk):
                     self._write_segment(data, duration)
-        except Exception as exc:
-            self.logger.error("Segmenter: pipe read error: " + str(exc), exc_info=True)
         finally:
             try:
-                pipe_fd.close()
+                os.close(pipe_fd)
             except Exception:
                 pass
 
@@ -309,9 +339,12 @@ class Segmenter(threading.Thread):
             self.logger.error("Error updating playlist: " + str(exc))
 
     def _clean_old_segments(self):
-        # Keep one segment beyond the playlist window so a client that just
-        # fetched the previous playlist can still load its oldest entry.
-        keep = self.settings.playlist_size() + 1
+        # RFC 8216 §6.2.2: a segment must stay available for at least
+        # playlist_duration + segment_duration after it leaves the
+        # playlist.  With 1–2 s segments a slow client that fetched the
+        # previous playlist can 404 on its oldest entry.  Keep twice the
+        # playlist size to cover the window safely (cheap on tmpfs).
+        keep = 2 * self.settings.playlist_size()
         if len(self.segments) > keep:
             for _idx, seg_path, _created_at, _duration in self.segments[:-keep]:
                 try:
@@ -342,14 +375,14 @@ class Segmenter(threading.Thread):
 
 
 class StreamService(object):
-    def __init__(self, settings, logger, ensure_hls_dir, reactor):
+    def __init__(self, settings, logger, ensure_hls_dir, reactor, credentials_provider=None):
         self.streams = {}
         self.settings = settings
         self.logger = logger
         self.ensure_hls_dir = ensure_hls_dir
         self.reactor = reactor
+        self._credentials_provider = credentials_provider  # None = default "root", ""
         self._cleanup_timer = None
-        self._local_ip = None  # cached via get_local_ip (avoids subprocess per call)
 
         self._ensure_directories()
         self._start_cleanup_timer()
@@ -390,9 +423,11 @@ class StreamService(object):
             self.streams.pop(stream_id, None)
 
     def _read_e2_credentials(self):
+        """Enigma2 basic-auth credentials from the injected provider."""
+        if self._credentials_provider is None:
+            return "root", ""
         try:
-            from ..platform.enigma2.config import read_e2_credentials
-            return read_e2_credentials()
+            return self._credentials_provider()
         except Exception:
             return "root", ""
 
@@ -550,24 +585,12 @@ class StreamService(object):
             self.streams[stream_id]["last_accessed"] = time.time()
 
     def get_status(self):
-        hls_dir = self.settings.hls_dir()
-        if self._local_ip is None:
-            try:
-                from twisted.internet import address
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                self._local_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                self._local_ip = "0.0.0.0"
-
         status = {}
 
         for stream_id, info in self.streams.items():
-            files = []
+            # Use the segmenter's internal list instead of os.listdir —
+            # avoids a blocking directory scan on the reactor thread.
             seg_count = 0
-            if os.path.exists(hls_dir):
-                files = [name for name in os.listdir(hls_dir) if name.startswith(stream_id)]
             if info.get("segmenter"):
                 seg_count = len(info["segmenter"].segments)
 
@@ -577,7 +600,6 @@ class StreamService(object):
                 "port": str(self.settings.stream_port()),
                 "has_auth": bool(info["params"].get("user")),
                 "uptime": int(time.time() - info["started"]),
-                "files": files,
                 "segments": seg_count,
                 "access_count": info["access_count"],
                 "crash_count": info.get("crash_count", 0),
