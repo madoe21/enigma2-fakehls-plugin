@@ -25,7 +25,6 @@ class AppContext(object):
         self.stream_service = StreamService(
             settings=self.settings,
             logger=self.logger,
-            local_ip_provider=get_local_ip,
             ensure_hls_dir=ensure_hls_dir,
             reactor=reactor,
         )

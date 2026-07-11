@@ -8,6 +8,7 @@ import re
 import urllib.parse
 
 from twisted.internet import reactor
+from twisted.web import static
 from twisted.web.resource import Resource
 from twisted.web.server import NOT_DONE_YET, Site
 
@@ -333,8 +334,18 @@ class HlsRoot(Resource):
         self.settings = settings
         self.local_ip_provider = local_ip_provider
         self.html_template = html_template
+        # Bouquet parsing triggers O(N) lamedb lookups per request on the
+        # shared reactor; cache per file mtime. Name lookups are cached for
+        # the process lifetime — lamedb only changes on a service scan,
+        # which comes with a GUI restart anyway.
+        self._channels_cache = {}
+        self._name_cache = {}
 
     def getChild(self, name, request):
+        # When the path contains colons (e.g. service refs like 1:0:19:EF11:…
+        # or ports like :8003), Twisted splits on ':' for virtual hosts, so
+        # render_GET never sees the full path. Force the root to handle
+        # everything so our regex can match the full ref.
         return self
 
     def render_GET(self, request):
@@ -552,6 +563,29 @@ class HlsRoot(Resource):
             request.setResponseCode(404)
             return b""
 
+        if filename.endswith(".ts"):
+            # Segments are 2–5 MB. Reading them inline blocks the reactor —
+            # which is enigma2's main loop (GUI + tuner stream) — for the
+            # whole read. static.File streams via a producer instead, in
+            # chunks, only when the socket can take more.
+            try:
+                client_ip = request.getClientIP()
+                resource = static.File(filepath, defaultType="video/MP2T")
+                resource.contentTypes = {".ts": "video/MP2T"}
+                resource.isLeaf = True
+                # Log when the response is done — static.File may answer
+                # 206 (Range) or 304, and only then are code/size real.
+                finished = request.notifyFinish()
+                finished.addCallback(
+                    lambda _: self.logger.log_request(
+                        "GET", "/hls/" + filename, client_ip, request.code, request.sentLength))
+                finished.addErrback(lambda _: None)
+                return resource.render_GET(request)
+            except Exception as exc:
+                self.logger.error("Error serving HLS segment " + filename + ": " + str(exc))
+                request.setResponseCode(500)
+                return b""
+
         try:
             with open(filepath, "rb") as handle:
                 data = handle.read()
@@ -563,8 +597,6 @@ class HlsRoot(Resource):
         if filename.endswith(".m3u8"):
             request.setHeader(b"Content-Type", b"application/vnd.apple.mpegurl")
             request.setHeader(b"Cache-Control", b"no-cache, no-store")
-        elif filename.endswith(".ts"):
-            request.setHeader(b"Content-Type", b"video/MP2T")
 
         self.logger.log_request("GET", "/hls/" + filename, request.getClientIP(), 200, len(data))
         return data
@@ -688,7 +720,7 @@ class HlsRoot(Resource):
             if not os.path.exists(path):
                 return self._json_response(
                     request, {"error": "Bouquet not found: " + filename}, 404)
-            return self._json_response(request, self._parse_channel_file(path))
+            return self._json_response(request, self._channels_for(path))
         except Exception as exc:
             self.logger.error("API channels error: " + str(exc))
             return self._json_response(request, {"error": str(exc)}, 500)
@@ -787,6 +819,22 @@ class HlsRoot(Resource):
             pass
         return None
 
+    def _channels_for(self, path):
+        """Return cached channel list for *path*, keyed by (path, mtime)."""
+        try:
+            st = os.stat(path)
+            key = (path, st.st_mtime)
+        except OSError:
+            return []
+
+        cached = self._channels_cache.get(key)
+        if cached is not None:
+            return cached
+
+        channels = self._parse_channel_file(path)
+        self._channels_cache[key] = channels
+        return channels
+
     def _parse_channel_file(self, path):
         channels = []
         current_service = None
@@ -820,16 +868,23 @@ class HlsRoot(Resource):
         return [ch for ch in channels if ch["name"]]
 
     def _resolve_service_name(self, ref):
-        """Look up a channel name in enigma2's service database."""
+        """Look up a channel name in enigma2's service database, with cache."""
+        cached = self._name_cache.get(ref)
+        if cached is not None:
+            return cached
+
         if eServiceCenter is None or eServiceReference is None:
+            self._name_cache[ref] = ""
             return ""
         try:
             service = eServiceReference(ref)
             info = eServiceCenter.getInstance().info(service)
             name = info.getName(service) if info else ""
+            self._name_cache[ref] = name or ""
             return name or ""
         except Exception as exc:
             self.logger.debug("Name lookup failed for %s: %s" % (ref, exc))
+            self._name_cache[ref] = ""
             return ""
 
     def _build_web_html(self, bouquets, errors):

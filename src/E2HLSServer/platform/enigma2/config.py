@@ -16,6 +16,8 @@ from Components.config import (
 )
 from Tools.Directories import SCOPE_PLUGINS, resolveFilename
 
+from ...core.streamrelay import DEFAULT_STREAMRELAY_PORT, StreamRelayWhitelist
+
 
 def localeInit():
 	try:
@@ -122,6 +124,29 @@ def read_e2_credentials():
 		return "root", ""
 
 
+_STREAMRELAY_WHITELIST = StreamRelayWhitelist()
+
+
+def read_streamrelay_port():
+	"""The receiver's softcam stream-relay port.
+
+	Prefer the live Enigma2 config object; fall back to parsing the settings
+	file (the key is absent while the receiver still runs the default).
+	"""
+	try:
+		return int(config.misc.softcam_streamrelay_port.value)
+	except Exception:
+		pass
+	try:
+		with open("/etc/enigma2/settings", "r") as handle:
+			for line in handle:
+				if line.startswith("config.misc.softcam_streamrelay_port="):
+					return int(line.split("=", 1)[1].strip())
+	except Exception:
+		pass
+	return DEFAULT_STREAMRELAY_PORT
+
+
 def ensure_hls_dir(hls_dir=None):
 	if hls_dir is None:
 		hls_dir = config.plugins.e2hlsserver.hls_dir.value
@@ -226,6 +251,12 @@ class Enigma2Settings(object):
 
 	def playlist_size(self):
 		return DEFAULT_PLAYLIST_SIZE
+
+	def streamrelay_port(self):
+		return read_streamrelay_port()
+
+	def streamrelay_whitelist(self):
+		return _STREAMRELAY_WHITELIST
 
 	def ffmpeg_bin(self):
 		return "/usr/bin/ffmpeg"

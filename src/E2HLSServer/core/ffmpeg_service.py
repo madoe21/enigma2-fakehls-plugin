@@ -2,14 +2,38 @@
 from __future__ import absolute_import
 
 import os
+import re
 import subprocess
 import threading
 import urllib.parse
 
 
+def mask_credentials(url):
+    """Log-safe form of a stream URL — embedded credentials stripped."""
+    return re.sub(r"//[^/@]+@", "//***@", url)
+
+
+def _streamrelay_url(ref, settings):
+    """Relay URL when the receiver routes this service through the softcam
+    stream relay; None otherwise. Pulling a whitelisted (ICAM) service from
+    the plain stream port yields a scrambled TS, so the relay wins over
+    both the stream port and the HW transcode port."""
+    whitelist_fn = getattr(settings, "streamrelay_whitelist", None)
+    port_fn = getattr(settings, "streamrelay_port", None)
+    if whitelist_fn is None or port_fn is None:  # platform without relay support
+        return None
+    if not whitelist_fn().contains(ref):
+        return None
+    return "http://127.0.0.1:" + str(port_fn()) + "/" + ref
+
+
 def build_stream_url(params, settings):
     ref = params.get("ref", "")
     hw = params.get("hw", False)
+
+    relay_url = _streamrelay_url(ref, settings)
+    if relay_url:
+        return relay_url
 
     if hw:
         port = str(settings.stream_hw_port())
@@ -111,3 +135,39 @@ def start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings, on_exit=
     except Exception as exc:
         print("[E2HLSServer] ERROR starting FFmpeg: " + str(exc))
         return None
+
+
+def async_start_ffmpeg(stream_url, output_pipe, stream_id, log_dir, settings,
+                       on_ready, on_exit=None, e2_user=None, e2_pass=None):
+    """Start ffmpeg in a background thread so the caller doesn't block.
+
+    Invokes ``on_ready(process, ffmpeg_log)`` when ffmpeg is ready (or
+    fails), with ``process`` being *None* on failure.  Optionally calls
+    ``on_exit(stream_id, retcode, ffmpeg_log)`` when the process terminates.
+    """
+    ffmpeg_log = os.path.join(log_dir, stream_id + "_ffmpeg.log")
+    cmd = build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=e2_user, e2_pass=e2_pass)
+
+    def _spawn():
+        try:
+            with open(ffmpeg_log, "w", encoding="utf-8") as log_handle:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                )
+            print("[E2HLSServer] FFmpeg started for stream " + stream_id + " PID=" + str(process.pid) + " mode=copy")
+            on_ready(stream_id, process, ffmpeg_log)
+
+            if on_exit:
+                def monitor():
+                    ret = process.wait()
+                    on_exit(stream_id, ret, ffmpeg_log)
+
+                threading.Thread(target=monitor, daemon=True, name="ffmpeg-exit-" + stream_id).start()
+        except Exception as exc:
+            print("[E2HLSServer] ERROR starting FFmpeg: " + str(exc))
+            on_ready(stream_id, None, ffmpeg_log)
+
+    threading.Thread(target=_spawn, daemon=True, name="ffmpeg-" + stream_id).start()
