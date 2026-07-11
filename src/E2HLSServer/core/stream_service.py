@@ -6,7 +6,7 @@ import os
 import threading
 import time
 
-from .ffmpeg_service import build_stream_url, start_ffmpeg
+from .ffmpeg_service import build_stream_url, mask_credentials, start_ffmpeg
 from .mpegts import (
     TS_PACKET_SIZE,
     find_keyframe_cut,
@@ -430,6 +430,9 @@ class StreamService(object):
         segmenter.create_pipe()
 
         stream_url = build_stream_url(effective_params, self.settings)
+        # Which source the input comes from (stream port vs relay) is the
+        # first question in every dropout report — log it per stream.
+        self.logger.info("Stream " + stream_id + " input: " + mask_credentials(stream_url))
         process = start_ffmpeg(
             stream_url,
             segmenter.pipe_path,

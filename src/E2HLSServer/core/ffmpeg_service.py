@@ -2,14 +2,38 @@
 from __future__ import absolute_import
 
 import os
+import re
 import subprocess
 import threading
 import urllib.parse
 
 
+def mask_credentials(url):
+    """Log-safe form of a stream URL — embedded credentials stripped."""
+    return re.sub(r"//[^/@]+@", "//***@", url)
+
+
+def _streamrelay_url(ref, settings):
+    """Relay URL when the receiver routes this service through the softcam
+    stream relay; None otherwise. Pulling a whitelisted (ICAM) service from
+    the plain stream port yields a scrambled TS, so the relay wins over
+    both the stream port and the HW transcode port."""
+    whitelist_fn = getattr(settings, "streamrelay_whitelist", None)
+    port_fn = getattr(settings, "streamrelay_port", None)
+    if whitelist_fn is None or port_fn is None:  # platform without relay support
+        return None
+    if not whitelist_fn().contains(ref):
+        return None
+    return "http://127.0.0.1:" + str(port_fn()) + "/" + ref
+
+
 def build_stream_url(params, settings):
     ref = params.get("ref", "")
     hw = params.get("hw", False)
+
+    relay_url = _streamrelay_url(ref, settings)
+    if relay_url:
+        return relay_url
 
     if hw:
         port = str(settings.stream_hw_port())
