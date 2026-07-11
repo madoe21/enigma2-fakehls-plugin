@@ -14,3 +14,9 @@ __pycache__/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# In-tree venv (accidentally created at repo root; actively used by pytest)
+Lib/
+Scripts/
+pyvenv.cfg
+Include/
