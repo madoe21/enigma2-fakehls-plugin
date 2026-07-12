@@ -2,25 +2,25 @@
   "hooks": {
     "PostToolUse": [
       {
+        "matcher": "Edit|Write",
         "hooks": [
           {
-            "command": "bash .claude/hooks/format.sh",
-            "type": "command"
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/format.ps1"
           }
-        ],
-        "matcher": "Edit|Write"
+        ]
       }
     ],
     "SessionStart": [
       {
         "hooks": [
           {
-            "command": "bash .claude/hooks/caveman.sh",
-            "type": "command"
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/caveman.ps1"
           },
           {
-            "command": "bash .claude/hooks/beads-sync.sh",
-            "type": "command"
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/beads-sync.ps1"
           }
         ]
       }

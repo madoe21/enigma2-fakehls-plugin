@@ -12,7 +12,7 @@ jobs:
             echo "PRs to main must originate from 'develop' (got '${{ github.head_ref }}')"
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Version must equal develop with stripped -build suffix

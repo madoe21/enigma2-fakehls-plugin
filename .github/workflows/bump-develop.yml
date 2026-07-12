@@ -12,7 +12,7 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: develop
           fetch-depth: 0
@@ -31,7 +31,7 @@ jobs:
         run: echo "${{ steps.next.outputs.version }}" > VERSION
 
       - name: Open PR
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: chore/bump-${{ steps.next.outputs.version }}
           base: develop

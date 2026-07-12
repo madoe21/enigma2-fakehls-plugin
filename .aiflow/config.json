@@ -1,13 +1,36 @@
 {
-  "caveman":   { "enabled": true, "mode": "full" },
-  "rtk":       { "enabled": true },
-  "router":    { "enabled": false },
-  "graphify":  { "enabled": true },
-  "taskmaster":{ "enabled": true },
-  "mcp":       { "filesystem": true, "context7": true, "cocoindex": true },
-  "memory":    { "enabled": true, "graph": true, "intensity": "aggressive" },
-  "claude":    { "auth": "apikey" },
-  "vcs":       { "system": "git" },
+  "caveman": {
+    "enabled": true,
+    "mode": "full"
+  },
+  "rtk": {
+    "enabled": true
+  },
+  "router": {
+    "enabled": false
+  },
+  "graphify": {
+    "enabled": true
+  },
+  "taskmaster": {
+    "enabled": true
+  },
+  "mcp": {
+    "filesystem": true,
+    "context7": true,
+    "cocoindex": true
+  },
+  "memory": {
+    "enabled": true,
+    "graph": true,
+    "intensity": "aggressive"
+  },
+  "claude": {
+    "auth": "apikey"
+  },
+  "vcs": {
+    "system": "git"
+  },
   "remote": {
     "type": "github",
     "baseUrl": "https://github.com",
@@ -15,11 +38,27 @@
     "tokenEnv": "GITHUB_TOKEN",
     "mcp": "github"
   },
-  "sync":    { "askOnClose": true, "pullOnStart": true },
-  "ollama":  { "enabled": false, "url": "http://localhost:11434", "models": [] },
-  "teamPrefs": { "enabled": false, "codeStyle": "google" },
-  "project": { "aim": "", "architecture": "" },
-  "dev": { "os": "windows", "ide": "vscode" },
+  "sync": {
+    "askOnClose": true,
+    "pullOnStart": true
+  },
+  "ollama": {
+    "enabled": false,
+    "url": "http://localhost:11434",
+    "models": []
+  },
+  "teamPrefs": {
+    "enabled": false,
+    "codeStyle": "google"
+  },
+  "project": {
+    "aim": "",
+    "architecture": ""
+  },
+  "dev": {
+    "os": "windows",
+    "ide": "vscode"
+  },
   "git": {
     "model": "simple",
     "strict": true,
@@ -29,5 +68,8 @@
     "releaseTags": true,
     "chore": true
   },
-  "templates_search": false
+  "templates_search": false,
+  "meta": {
+    "aiflowVersion": "0.2.0"
+  }
 }

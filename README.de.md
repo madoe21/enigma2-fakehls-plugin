@@ -1,5 +1,7 @@
 # aiflow
 
+[![Built with aiflow](https://img.shields.io/badge/built%20with-aiflow-6b46c1)](https://github.com/cyber93de/aiflow)
+
 **aiflow macht aus jedem Repository mit einem Befehl eine gesteuerte, KI-getriebene
 Software-Lieferstrecke.** Es verbindet [Claude Code](https://docs.claude.com/en/docs/claude-code)
 mit dauerhaftem Task-Tracking, autonomen Arbeits-Loops, einem Code-Wissensgraphen, spezialisierten
