@@ -29,11 +29,14 @@ class FakeSettings(object):
 
 
 class FakeLogger(object):
+    def __init__(self):
+        self.warnings = []
+
     def error(self, message, **_kwargs):
         pass
 
     def warning(self, message, **_kwargs):
-        pass
+        self.warnings.append(message)
 
     def info(self, message, **_kwargs):
         pass
@@ -58,9 +61,10 @@ class FakeReactor(object):
 
 
 class FakeSegmenter(object):
-    def __init__(self, segment_count):
+    def __init__(self, segment_count, pipe_path=None):
         self.segments = [None] * segment_count
         self.writer_exit_notified = False
+        self.pipe_path = pipe_path
 
     def notify_writer_exited(self):
         self.writer_exit_notified = True
@@ -160,6 +164,48 @@ class StreamServiceTest(unittest.TestCase):
         self.assertFalse(new_segmenter.writer_exit_notified)
         self.assertEqual(service.streams["abcd1234"]["crash_count"], 0)
 
+    def test_stale_ffmpeg_exit_removes_residue_pipe_file(self):
+        # After remove_pipe(), the orphan ffmpeg's O_CREAT may have
+        # re-created the old pipe path as a regular file full of TS.
+        service = self._service()
+        residue = os.path.join(self.tmp_dir, "abcd1234_pipe3")
+        with open(residue, "wb") as handle:
+            handle.write(b"ts-garbage")
+        old_segmenter = FakeSegmenter(0, pipe_path=residue)
+        service.streams["abcd1234"] = self._stream_entry(FakeSegmenter(0))
+        service._on_ffmpeg_exit("abcd1234", 1, None,
+                                expected_segmenter=old_segmenter)
+        self.assertFalse(os.path.exists(residue))
+
+    def test_residue_pipe_unlink_failure_logs_warning(self):
+        service = self._service()
+        residue = os.path.join(self.tmp_dir, "abcd1234_pipe5")
+        with open(residue, "wb") as handle:
+            handle.write(b"x")
+        old_segmenter = FakeSegmenter(0, pipe_path=residue)
+        original_unlink = stream_service.os.unlink
+
+        def failing_unlink(_path):
+            raise OSError("permission denied")
+
+        stream_service.os.unlink = failing_unlink
+        try:
+            service._on_ffmpeg_exit("gone", 1, None,
+                                    expected_segmenter=old_segmenter)
+        finally:
+            stream_service.os.unlink = original_unlink
+        self.assertTrue(
+            any("residue" in msg for msg in service.logger.warnings))
+
+    def test_stale_ffmpeg_exit_without_residue_is_harmless(self):
+        service = self._service()
+        missing = os.path.join(self.tmp_dir, "abcd1234_pipe9")
+        old_segmenter = FakeSegmenter(0, pipe_path=missing)
+        # Stream gone entirely — must not raise, nothing to unlink.
+        service._on_ffmpeg_exit("gone", 1, None,
+                                expected_segmenter=old_segmenter)
+        self.assertFalse(os.path.exists(missing))
+
     def test_stale_ffmpeg_spawn_terminates_orphan_process(self):
         class FakeProcess(object):
             def __init__(self):
@@ -181,14 +227,18 @@ class StreamServiceTest(unittest.TestCase):
         # Pre-upgrade runs left unsuffixed pipes behind; both forms must go.
         leftover_old_pipe = os.path.join(self.tmp_dir, "abcd1234_pipe")
         leftover_seg = os.path.join(self.tmp_dir, "abcd1234_seg00001.ts")
+        # Crash between playlist tmp-write and rename leaves a .m3u8.tmp.
+        leftover_tmp = os.path.join(self.tmp_dir, "live_abcd1234.m3u8.tmp")
         keeper = os.path.join(self.tmp_dir, "unrelated.txt")
-        for path in (leftover_pipe, leftover_old_pipe, leftover_seg, keeper):
+        for path in (leftover_pipe, leftover_old_pipe, leftover_seg,
+                     leftover_tmp, keeper):
             with open(path, "wb") as handle:
                 handle.write(b"x")
         service.cleanup_old_session_files()
         self.assertFalse(os.path.exists(leftover_pipe))
         self.assertFalse(os.path.exists(leftover_old_pipe))
         self.assertFalse(os.path.exists(leftover_seg))
+        self.assertFalse(os.path.exists(leftover_tmp))
         self.assertTrue(os.path.exists(keeper))
 
     def test_clean_ffmpeg_exit_notifies_without_crash_count(self):

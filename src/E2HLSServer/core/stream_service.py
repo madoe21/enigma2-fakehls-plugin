@@ -5,6 +5,7 @@ import hashlib
 import itertools
 import os
 import select
+import stat
 import threading
 import time
 
@@ -558,6 +559,12 @@ class StreamService(object):
         self.logger.log_ffmpeg_exit(stream_id, retcode, ffmpeg_log)
         info = self._stream_info_for(stream_id, expected_segmenter)
         if info is None:
+            # Stale exit: after the old segmenter's remove_pipe(), the
+            # orphan ffmpeg may have re-created its pipe path as a regular
+            # file (O_CREAT) and dumped TS into it — remove that residue
+            # now instead of leaving it until the next plugin start.
+            if expected_segmenter is not None:
+                self._remove_residue_pipe(expected_segmenter)
             return
         if info.get("segmenter"):
             # No writer will attach to the FIFO anymore — let the
@@ -565,6 +572,23 @@ class StreamService(object):
             info["segmenter"].notify_writer_exited()
         if retcode != 0 and info.get("process") is not None:
             info["crash_count"] = info.get("crash_count", 0) + 1
+
+    def _remove_residue_pipe(self, segmenter):
+        """Delete a stale life's pipe path; per-life names make it garbage."""
+        path = segmenter.pipe_path
+        try:
+            if not path or not os.path.exists(path):
+                return
+            # The residue is by definition a regular file (ffmpeg's O_CREAT
+            # after remove_pipe). An actual FIFO here is never ours to
+            # delete — it would mean a live segmenter owns the path.
+            if stat.S_ISFIFO(os.stat(path).st_mode):
+                return
+            os.unlink(path)
+            self.logger.debug("Removed residue pipe file " + path)
+        except Exception as exc:
+            self.logger.warning(
+                "Could not remove residue pipe file: " + str(exc))
 
     def _on_ffmpeg_spawned(self, stream_id, process, ffmpeg_log, expected_segmenter=None):
         """Runs on the reactor thread (marshalled via _marshal)."""
@@ -639,7 +663,10 @@ class StreamService(object):
             if os.path.exists(hls_dir):
                 for name in os.listdir(hls_dir):
                     path = os.path.join(hls_dir, name)
-                    if (name.endswith(".ts") or name.endswith(".m3u8") or "_pipe" in name) and os.path.exists(path):
+                    # .m3u8.tmp: a crash between the playlist tmp-write and
+                    # its rename leaves the tmp file behind.
+                    if (name.endswith((".ts", ".m3u8", ".m3u8.tmp"))
+                            or "_pipe" in name) and os.path.exists(path):
                         os.unlink(path)
                 self.logger.info("Cleaned up old session files")
         except Exception as exc:
