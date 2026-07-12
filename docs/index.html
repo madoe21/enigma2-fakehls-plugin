@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>E2HLS Server — Enigma2 Plugin</title>
+<meta name="description" content="Streams live TV channels from your Enigma2 receiver as HLS to any device (Roku, browser, VLC, etc.) — copy-only, no re-encoding, no temp-file bloat.">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 760px; margin: 0 auto; padding: 2rem 1.25rem 4rem; line-height: 1.55; }
+  h1 { margin-bottom: 0.25rem; }
+  .tagline { opacity: 0.75; margin-top: 0; }
+  .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px; background: #6b46c1; color: #fff; font-size: 0.8rem; text-decoration: none; }
+  code, pre { background: rgba(127,127,127,0.15); border-radius: 6px; }
+  code { padding: 0.1rem 0.35rem; }
+  pre { padding: 0.9rem 1rem; overflow-x: auto; }
+  .shots { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1rem 0; }
+  .shots img { max-width: 100%; border-radius: 8px; border: 1px solid rgba(127,127,127,0.3); }
+  .shots-empty { opacity: 0.6; font-style: italic; }
+  footer { margin-top: 3rem; opacity: 0.7; font-size: 0.9rem; }
+  a { color: #6b46c1; }
+</style>
+</head>
+<body>
+  <a class="badge" href="https://github.com/madoe21/enigma2-fakehls-plugin">GitHub repo</a>
+  <h1>E2HLS Server</h1>
+  <p class="tagline">Enigma2 plugin — part of the <a href="https://madoe21.github.io/enigma2-madoe21-feed/">madoe21 feed</a></p>
+
+  <p>Streams live TV channels from your Enigma2 receiver as HLS to any device (Roku, browser, VLC, etc.) — copy-only, no re-encoding, no temp-file bloat.</p>
+
+  <h2>Install</h2>
+  <p>Add the feed once (skip if already done), then install this plugin — either from your
+  receiver's plugin manager, or via SSH:</p>
+  <pre><code>echo 'src/gz madoe21 https://madoe21.github.io/enigma2-madoe21-feed/feed' &gt; /etc/opkg/madoe21-feed.conf
+opkg update
+opkg install enigma2-plugin-extensions-e2hlsserver</code></pre>
+
+  <h2>Screenshots</h2>
+  <div class="shots">
+    <p class="shots-empty">Screenshots coming soon.</p>
+    <!-- Drop images into docs/images/ and reference them here, e.g.:
+    <img src="images/screenshot-1.png" alt="E2HLS Server screenshot"> -->
+  </div>
+
+  <footer>
+    Part of the <a href="https://github.com/madoe21">madoe21</a> Enigma2 plugin collection ·
+    <a href="https://github.com/madoe21/enigma2-fakehls-plugin/blob/main/README.md">full README</a> ·
+    <a href="https://madoe21.github.io/enigma2-madoe21-feed/">feed overview</a>
+  </footer>
+</body>
+</html>
