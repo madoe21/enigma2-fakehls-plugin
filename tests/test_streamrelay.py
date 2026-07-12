@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unit tests for the stream-relay whitelist handling."""
+import contextlib
+import io
 import os
 import shutil
 import tempfile
@@ -98,6 +100,36 @@ class StreamRelayWhitelistTest(unittest.TestCase):
         self._write(REF_B + "\n")
         self.assertTrue(self.whitelist.contains(REF_B))
         self.assertFalse(self.whitelist.contains(REF_A))
+
+    def test_read_failure_warns_via_injected_logger(self):
+        class RecordingLogger(object):
+            def __init__(self):
+                self.warnings = []
+
+            def warning(self, message, **_kwargs):
+                self.warnings.append(message)
+
+        logger = RecordingLogger()
+        self.whitelist.set_logger(logger)
+        self._write(REF_A + "\n")
+        self.assertTrue(self.whitelist.contains(REF_A))
+        # Replace the file with a directory: os.stat succeeds, open() fails.
+        os.unlink(self.path)
+        os.mkdir(self.path)
+        self.whitelist.contains(REF_A)
+        self.assertTrue(any("whitelist" in msg for msg in logger.warnings))
+
+    def test_read_failure_without_logger_falls_back_to_print(self):
+        self._write(REF_A + "\n")
+        self.assertTrue(self.whitelist.contains(REF_A))
+        # Replace the file with a directory: os.stat succeeds, open() fails.
+        os.unlink(self.path)
+        os.mkdir(self.path)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.whitelist.contains(REF_A)
+        self.assertIn("WARNING", stdout.getvalue())
+        self.assertIn("whitelist", stdout.getvalue())
 
 
 if __name__ == "__main__":

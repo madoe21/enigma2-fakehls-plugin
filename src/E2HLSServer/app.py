@@ -26,6 +26,9 @@ class AppContext(object):
             log_dir=os.path.join(self.settings.hls_dir(), "logs"),
             debug_mode=self.settings.debug_enabled(),
         )
+        # The whitelist is created at config-import time, before this
+        # logger exists — wire it up now so its warnings hit plugin.log.
+        self.settings.streamrelay_whitelist().set_logger(self.logger)
 
         self.stream_service = StreamService(
             settings=self.settings,

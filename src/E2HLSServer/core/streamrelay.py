@@ -27,10 +27,16 @@ def normalize_service_ref(ref):
 class StreamRelayWhitelist(object):
     """The receiver's stream-relay whitelist, reloaded when the file changes."""
 
-    def __init__(self, path=WHITELIST_PATH):
+    def __init__(self, path=WHITELIST_PATH, logger=None):
         self._path = path
+        self._logger = logger
         self._cache_key = None
         self._refs = frozenset()
+
+    def set_logger(self, logger):
+        """Late logger injection — the whitelist is created at import time,
+        before the plugin logger exists."""
+        self._logger = logger
 
     def refs(self):
         """Current set of normalized whitelisted refs (cached per file state)."""
@@ -68,7 +74,14 @@ class StreamRelayWhitelist(object):
                     if line and not line.startswith("#"):
                         refs.add(normalize_service_ref(line))
         except Exception as exc:
-            print("[E2HLSServer] WARNING: cannot read stream-relay whitelist "
-                  + self._path + ": " + str(exc))
+            # This warning must never be lost: an unreadable whitelist
+            # silently routes ICAM refs to the plain port (broken picture).
+            # print is the pre-wiring fallback only.
+            message = ("cannot read stream-relay whitelist "
+                       + self._path + ": " + str(exc))
+            if self._logger is not None:
+                self._logger.warning(message)
+            else:
+                print("[E2HLSServer] WARNING: " + message)
             return None
         return frozenset(refs)
