@@ -123,6 +123,16 @@ const RECOVERY_RESET_AFTER_MS = 20000;
 let recoveryAttempts = 0;
 let recoveryResetTimer = null;
 let currentHlsUrl = null;
+// Some stuck states (e.g. the player silently never getting past the
+// filler->real-content discontinuity on a brand-new stream) don't fire a
+// Shaka error event at all - buffered just stops growing. That's exactly
+// what switching channels away and back was papering over by hand: watch
+// for "no forward buffer progress for a while" and trigger the same
+// recovery an error would, without needing the manual retry.
+const STALL_WATCHDOG_MS = 12000;
+let stallWatchdogInterval = null;
+let stallLastBufEnd = -1;
+let stallLastProgressAt = 0;
 
 // Hold playback until enough forward buffer exists. Starting immediately on a
 // fresh stream means playing exactly as fast as ffmpeg produces — zero
@@ -147,14 +157,10 @@ function startWhenBuffered(v) {
 
 function onQualityChange() { if (cur >= 0) play(cur); }
 
-function onPlayerError(error) {
-  // RECOVERABLE errors Shaka already retries/continues past internally
-  // (that's the whole point of the severity split); only CRITICAL ones stop
-  // playback and need our own recovery.
-  if (error.severity !== shaka.util.Error.Severity.CRITICAL) return;
+function attemptRecovery(label) {
   if (recoveryAttempts >= MAX_ERROR_RECOVERIES) {
     document.getElementById('loading').classList.remove('show');
-    showMsg('Stream-Fehler: Code ' + error.code + ' (Wiederherstellung fehlgeschlagen)');
+    showMsg(label + ' (Wiederherstellung fehlgeschlagen)');
     return;
   }
   recoveryAttempts++;
@@ -162,16 +168,51 @@ function onPlayerError(error) {
   // A recovery that holds for a while wasn't a fluke - don't let an old
   // failure count against a channel that's since been fine.
   recoveryResetTimer = setTimeout(() => { recoveryAttempts = 0; }, RECOVERY_RESET_AFTER_MS);
-  showMsg('Stream-Fehler, stelle wieder her… (' + recoveryAttempts + '/' + MAX_ERROR_RECOVERIES + ')');
+  showMsg(label + ', stelle wieder her… (' + recoveryAttempts + '/' + MAX_ERROR_RECOVERIES + ')');
   // Shaka has no single-call "resume from here" like hls.js's
   // recoverMediaError() - a fresh load() is the documented recovery for a
   // critical error, same effect as switching channel away and back by hand.
   if (player && currentHlsUrl) {
-    player.load(currentHlsUrl).then(() => startWhenBuffered(document.getElementById('v'))).catch((e) => {
+    player.load(currentHlsUrl).then(() => armPlaybackWatchers(document.getElementById('v'))).catch((e) => {
       document.getElementById('loading').classList.remove('show');
       showMsg('Wiederherstellung fehlgeschlagen: ' + (e.message || e));
     });
   }
+}
+
+function onPlayerError(error) {
+  // RECOVERABLE errors Shaka already retries/continues past internally
+  // (that's the whole point of the severity split); only CRITICAL ones stop
+  // playback and need our own recovery.
+  if (error.severity !== shaka.util.Error.Severity.CRITICAL) return;
+  attemptRecovery('Stream-Fehler (Code ' + error.code + ')');
+}
+
+function disarmStallWatchdog() {
+  if (stallWatchdogInterval) { clearInterval(stallWatchdogInterval); stallWatchdogInterval = null; }
+}
+
+function armStallWatchdog(v) {
+  disarmStallWatchdog();
+  stallLastBufEnd = -1;
+  stallLastProgressAt = Date.now();
+  stallWatchdogInterval = setInterval(() => {
+    const bufEnd = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0;
+    if (bufEnd > stallLastBufEnd) {
+      stallLastBufEnd = bufEnd;
+      stallLastProgressAt = Date.now();
+      return;
+    }
+    if (Date.now() - stallLastProgressAt > STALL_WATCHDOG_MS) {
+      disarmStallWatchdog();
+      attemptRecovery('Stream hängt');
+    }
+  }, 1000);
+}
+
+function armPlaybackWatchers(v) {
+  startWhenBuffered(v);
+  armStallWatchdog(v);
 }
 
 function toggleList() {
@@ -237,12 +278,34 @@ function filterChannels(q) {
   cur = -1; renderList();
 }
 
+// Poll until the stream has cut real content, instead of handing the
+// player a URL that starts with the filler. VLC/native players sit through
+// the filler -> #EXT-X-DISCONTINUITY -> real transition just fine; browser
+// MSE players (Shaka, hls.js, any of them - same underlying browser decode
+// pipeline) are visibly slow re-initialising around that discontinuity,
+// which showed up as a long buffering hang. This path is web-player only.
+async function waitUntilReady(streamId, maxWaitMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxWaitMs) {
+    try {
+      const r = await fetch('/api/ready?id=' + encodeURIComponent(streamId));
+      const data = await r.json();
+      if (data.ready) return true;
+    } catch (e) { /* transient - keep polling */ }
+    document.getElementById('loading-text').textContent =
+      'Starte Stream… (' + Math.ceil((Date.now() - t0) / 1000) + 's)';
+    await new Promise(resolve => setTimeout(resolve, 700));
+  }
+  return false;
+}
+
 async function play(i) {
   cur = i;
   const ch = filtered[i];
   const v = document.getElementById('v');
   if (bufferTimer) { clearInterval(bufferTimer); bufferTimer = null; }
   if (recoveryResetTimer) { clearTimeout(recoveryResetTimer); recoveryResetTimer = null; }
+  disarmStallWatchdog();
   recoveryAttempts = 0;
   document.getElementById('placeholder').style.display = 'none';
   document.getElementById('loading-text').textContent = 'Starte Stream…';
@@ -253,12 +316,21 @@ async function play(i) {
   v.pause(); v.removeAttribute('src'); v.load();
   try {
     const quality = document.getElementById('quality-select').value;
-    // OpenWebInterface-style URL: /<service-ref> starts the stream and
-    // redirects to its HLS playlist — same shape as the STB streaming port.
-    const hlsUrl = '/' + ch.ref + '?quality=' + quality;
-    currentHlsUrl = hlsUrl;
     document.getElementById('url-bar').style.display = 'flex';
     document.getElementById('url-text').textContent = window.location.origin + '/' + ch.ref;
+
+    const startRes = await fetch('/api/start?ref=' + encodeURIComponent(ch.ref) + '&quality=' + encodeURIComponent(quality));
+    const startData = await startRes.json();
+    if (!startData.id) throw new Error(startData.error || 'Stream konnte nicht gestartet werden');
+    currentHlsUrl = '/hls/' + startData.playlist;
+
+    const gotReal = await waitUntilReady(startData.id, 45000);
+    if (!gotReal) {
+      // Gave up waiting - load anyway (filler and all); better than an
+      // infinite spinner, same as the pre-filler fallback behaviour.
+      document.getElementById('loading-text').textContent = 'Sender startet langsam, versuche trotzdem…';
+    }
+
     if (window.shaka && shaka.Player.isBrowserSupported()) {
       player = new shaka.Player();
       await player.attach(v);
@@ -274,11 +346,11 @@ async function play(i) {
         },
       });
       player.addEventListener('error', (event) => onPlayerError(event.detail));
-      await player.load(hlsUrl);
-      startWhenBuffered(v);
+      await player.load(currentHlsUrl);
+      armPlaybackWatchers(v);
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
-      v.src = hlsUrl;
-      v.oncanplay = () => startWhenBuffered(v);
+      v.src = currentHlsUrl;
+      v.oncanplay = () => armPlaybackWatchers(v);
     } else {
       throw new Error('Kein unterstützter HLS-Player in diesem Browser gefunden');
     }
@@ -415,6 +487,8 @@ class HlsRoot(Resource):
             return self.render_api_channels(request)
         if path == "/api/start":
             return self.render_api_start(request)
+        if path == "/api/ready":
+            return self.render_api_ready(request)
 
         # OpenWebInterface-style streaming: http://<box-ip>:<port>/<service-ref>
         # (same URL shape as the STB streaming port, just HLS on this port).
@@ -829,6 +903,19 @@ class HlsRoot(Resource):
         return self._json_response(request, {
             "id": stream_id,
             "playlist": "live_" + stream_id + ".m3u8",
+        })
+
+    def render_api_ready(self, request):
+        """True once the given stream has cut at least one real (non-filler)
+        segment - see StreamService.has_real_data."""
+        stream_id_raw = request.args.get(b"id", [None])[0]
+        if not stream_id_raw:
+            request.setResponseCode(400)
+            return self._json_response(request, {"error": "Missing id"}, 400)
+        stream_id = stream_id_raw.decode()
+        self.stream_service.update_access(stream_id)
+        return self._json_response(request, {
+            "ready": self.stream_service.has_real_data(stream_id),
         })
 
     def render_web(self, request):

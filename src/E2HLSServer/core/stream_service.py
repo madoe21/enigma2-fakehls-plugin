@@ -774,6 +774,21 @@ class StreamService(object):
         if stream_id in self.streams:
             self.streams[stream_id]["last_accessed"] = time.time()
 
+    def has_real_data(self, stream_id):
+        """True once at least one non-filler segment has been cut.
+
+        Lets a caller wait for real content instead of the filler before
+        handing a URL to a player that would otherwise have to sit through
+        the filler->real #EXT-X-DISCONTINUITY transition itself (native
+        players like VLC handle that fine and don't need this; browser
+        MSE-based players are visibly slow re-initialising around it, so the
+        web player polls this instead of loading the filler at all).
+        """
+        info = self.streams.get(stream_id)
+        if info is None or info.get("segmenter") is None:
+            return False
+        return any(not seg[4] for seg in info["segmenter"].segments)
+
     def get_status(self):
         status = {}
 
