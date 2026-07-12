@@ -503,16 +503,33 @@ class HlsRoot(Resource):
         def poll(remaining):
             if state["gone"]:
                 return
-            if os.path.exists(playlist) or remaining <= 0:
+            if os.path.exists(playlist):
                 try:
                     request.redirect(("/hls/live_" + stream_id + ".m3u8").encode())
                     request.finish()
                 except Exception:
                     pass
                 return
+            if remaining <= 0:
+                # Redirecting to a playlist that still doesn't exist is a
+                # guaranteed 404 the client has no reason to retry (VLC/
+                # browsers don't treat a dead manifest redirect as "try
+                # again shortly"). A cold start (ffmpeg spawn/probe + first
+                # segment) can legitimately take longer than a few seconds
+                # on the receiver's CPU, especially on the "stable" 4 s
+                # preset; 503 + Retry-After tells any well-behaved client to
+                # come back rather than giving up on a dead link.
+                try:
+                    request.setResponseCode(503)
+                    request.setHeader(b"Retry-After", b"2")
+                    request.write(b"Stream still starting")
+                    request.finish()
+                except Exception:
+                    pass
+                return
             reactor.callLater(0.25, poll, remaining - 1)
 
-        poll(40)  # up to 10 s
+        poll(160)  # up to 40 s - realistic worst case for a cold ffmpeg start
         return NOT_DONE_YET
 
     def render_root_stream(self, request, ref):
