@@ -489,7 +489,20 @@ class HlsRoot(Resource):
         return self._redirect_when_playlist_ready(request, stream_id)
 
     def _redirect_when_playlist_ready(self, request, stream_id):
-        """Redirect to the stream's playlist once it exists, without blocking.
+        """Redirect to the stream's playlist, which normally already exists.
+
+        get_or_create_stream() writes an initial filler segment synchronously
+        before returning (Segmenter.write_initial_segment), so in the normal
+        case the playlist is already on disk right here and this redirects
+        immediately - no waiting, no polling.
+
+        The poll loop below only runs as a fallback for the degraded case
+        where the filler asset failed to load (see _load_filler_bytes) and
+        the playlist genuinely doesn't exist yet. Be aware reactor.callLater
+        ticks were observed firing many seconds late under enigma2's reactor
+        integration here (measured ~12s for a 0.25s schedule) - this fallback
+        is best-effort, not a reliable bound. Fix the filler asset instead of
+        relying on this path working quickly.
 
         NEVER time.sleep() in a request handler here: the Twisted reactor
         shares enigma2's main event loop, which also drives the GUI and the
@@ -497,6 +510,15 @@ class HlsRoot(Resource):
         source, so the playlist we are waiting for can never appear.
         """
         playlist = os.path.join(self.settings.hls_dir(), "live_" + stream_id + ".m3u8")
+        redirect_path = ("/hls/live_" + stream_id + ".m3u8").encode()
+
+        if os.path.exists(playlist):
+            request.redirect(redirect_path)
+            return b""
+
+        self.logger.warning(
+            "Stream " + stream_id + ": playlist not ready synchronously "
+            "(filler asset missing?) - falling back to slow polling")
         state = {"gone": False}
         request.notifyFinish().addErrback(lambda _f: state.update(gone=True))
 
@@ -505,7 +527,7 @@ class HlsRoot(Resource):
                 return
             if os.path.exists(playlist):
                 try:
-                    request.redirect(("/hls/live_" + stream_id + ".m3u8").encode())
+                    request.redirect(redirect_path)
                     request.finish()
                 except Exception:
                     pass
@@ -514,11 +536,8 @@ class HlsRoot(Resource):
                 # Redirecting to a playlist that still doesn't exist is a
                 # guaranteed 404 the client has no reason to retry (VLC/
                 # browsers don't treat a dead manifest redirect as "try
-                # again shortly"). A cold start (ffmpeg spawn/probe + first
-                # segment) can legitimately take longer than a few seconds
-                # on the receiver's CPU, especially on the "stable" 4 s
-                # preset; 503 + Retry-After tells any well-behaved client to
-                # come back rather than giving up on a dead link.
+                # again shortly"); 503 + Retry-After at least tells a
+                # well-behaved client to come back instead of giving up.
                 try:
                     request.setResponseCode(503)
                     request.setHeader(b"Retry-After", b"2")
@@ -529,7 +548,7 @@ class HlsRoot(Resource):
                 return
             reactor.callLater(0.25, poll, remaining - 1)
 
-        poll(160)  # up to 40 s - realistic worst case for a cold ffmpeg start
+        poll(160)
         return NOT_DONE_YET
 
     def render_root_stream(self, request, ref):
