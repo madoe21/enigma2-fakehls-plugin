@@ -754,6 +754,20 @@ class StreamService(object):
         info = self.streams.get(stream_id)
         if info and info.get("segmenter"):
             info["segmenter"].cleanup_all()
+        self._remove_ffmpeg_log(stream_id)
+
+    def _remove_ffmpeg_log(self, stream_id):
+        # async_start_ffmpeg() names it deterministically from stream_id -
+        # not tracked in self.streams, so recompute rather than store it.
+        # Without this, every distinct channel ever watched leaves a
+        # permanent orphan file in tmpfs (only reused/truncated if the same
+        # channel is opened again).
+        log_path = os.path.join(self.settings.hls_dir(), "logs", stream_id + "_ffmpeg.log")
+        try:
+            if os.path.exists(log_path):
+                os.unlink(log_path)
+        except Exception:
+            pass
 
     def cleanup_old_session_files(self):
         hls_dir = self.settings.hls_dir()
@@ -766,9 +780,25 @@ class StreamService(object):
                     if (name.endswith((".ts", ".m3u8", ".m3u8.tmp"))
                             or "_pipe" in name) and os.path.exists(path):
                         os.unlink(path)
+                self._cleanup_old_ffmpeg_logs(hls_dir)
                 self.logger.info("Cleaned up old session files")
         except Exception as exc:
             self.logger.error("Error cleaning old files: " + str(exc))
+
+    def _cleanup_old_ffmpeg_logs(self, hls_dir):
+        # Per-stream ffmpeg logs (<id>_ffmpeg.log) from a prior enigma2/
+        # plugin life are otherwise never revisited unless that exact
+        # channel gets watched again - leaves orphans in tmpfs indefinitely.
+        # plugin.log/plugin.log.1 live in the same directory and must stay.
+        log_dir = os.path.join(hls_dir, "logs")
+        if not os.path.exists(log_dir):
+            return
+        for name in os.listdir(log_dir):
+            if name.endswith("_ffmpeg.log"):
+                try:
+                    os.unlink(os.path.join(log_dir, name))
+                except Exception:
+                    pass
 
     def update_access(self, stream_id):
         if stream_id in self.streams:
