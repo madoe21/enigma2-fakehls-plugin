@@ -73,12 +73,19 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
         "5",
         "-timeout",
         "30000000",
-        # Copy mode only needs PAT/PMT + codec ids; the 5 MB default probe
-        # costs several seconds of startup on an HD transport stream.
+        # 1MB/1s was too small to sync the AC3 audio PID on some channels
+        # (multi-track HD services carrying 5.1 + a second-language stereo
+        # track) - ffmpeg would then either drop the optional audio map
+        # entirely (silent output) or pick it up mid-stream (audio/video
+        # start offset that compounds into growing desync). Measured on the
+        # receiver: reliably resolves both AC3 tracks' channel count/sample
+        # rate from 4s of probe data, never at 3s. The filler-segment system
+        # (stream_service.py) already hides ffmpeg startup latency from
+        # every client, so this extra probe time costs nothing user-visible.
         "-probesize",
-        "1000000",
+        "5000000",
         "-analyzeduration",
-        "1000000",
+        "5000000",
         "-fflags",
         "nobuffer",
     ]
@@ -100,6 +107,16 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
         # AAC stereo plays everywhere, including VLC.
         "-c:v",
         "copy",
+        # Re-encoding audio from a decoder that silently drops/duplicates
+        # samples on a corrupt AC3 frame (common on this signal - see the
+        # PPS warnings in the video log) means the AAC encoder's sample
+        # count and the copied video PTS slowly stop agreeing. aresample's
+        # async mode inserts/drops samples to keep audio output timestamps
+        # tracking the input pts instead of just counting encoded samples,
+        # which is what actually stops the drift instead of just reducing
+        # its starting offset.
+        "-af",
+        "aresample=async=1:min_hard_comp=0.100000:first_pts=0",
         "-c:a",
         "aac",
         "-ac",
@@ -119,6 +136,12 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
         # are more lenient about it.
         "-output_ts_offset",
         str(_FILLER_RUNWAY_OFFSET_SECONDS),
+        # Live satellite feeds occasionally drop/corrupt AC3 frames; without
+        # a buffer big enough to absorb the resulting encoder/muxer stalls,
+        # packets get silently dropped instead of just delayed - defends
+        # against another source of audio gaps beyond the probe-size fix.
+        "-max_muxing_queue_size",
+        "4096",
         "-f",
         "mpegts",
         "-y",
