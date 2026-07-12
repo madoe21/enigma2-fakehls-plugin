@@ -253,7 +253,7 @@ class Segmenter(threading.Thread):
         """
         if self._filler_bytes is None:
             return False
-        self._write_segment(self._filler_bytes, _FILLER_DURATION)
+        self._write_segment(self._filler_bytes, _FILLER_DURATION, is_filler=True)
         self._last_filler_at = time.time()
         return True
 
