@@ -2,6 +2,7 @@
 from __future__ import absolute_import
 
 import hashlib
+import itertools
 import os
 import select
 import threading
@@ -163,6 +164,13 @@ class SegmentCutter(object):
         return duration
 
 
+# Per-life FIFO suffix: stream_id is a deterministic hash, so a reaped and
+# re-created stream would otherwise reuse the same pipe path — an orphan
+# ffmpeg from the previous life could attach to the new segmenter's FIFO
+# and interleave TS packets until its terminate lands.
+_PIPE_SEQUENCE = itertools.count()
+
+
 class Segmenter(threading.Thread):
     PIPE_READ_SIZE = 65536
     # Default FIFO capacity (64 KB) is ~65 ms of an 8 Mbit/s TS: any stall in
@@ -187,7 +195,8 @@ class Segmenter(threading.Thread):
         self._target_duration = int(self._seg_duration) + 1
 
         self.hls_dir = settings.hls_dir()
-        self.pipe_path = os.path.join(self.hls_dir, stream_id + "_pipe")
+        self.pipe_path = os.path.join(
+            self.hls_dir, stream_id + "_pipe" + str(next(_PIPE_SEQUENCE)))
         self.playlist = os.path.join(self.hls_dir, "live_" + stream_id + ".m3u8")
 
     def stop(self):
@@ -630,7 +639,7 @@ class StreamService(object):
             if os.path.exists(hls_dir):
                 for name in os.listdir(hls_dir):
                     path = os.path.join(hls_dir, name)
-                    if (name.endswith(".ts") or name.endswith(".m3u8") or name.endswith("_pipe")) and os.path.exists(path):
+                    if (name.endswith(".ts") or name.endswith(".m3u8") or "_pipe" in name) and os.path.exists(path):
                         os.unlink(path)
                 self.logger.info("Cleaned up old session files")
         except Exception as exc:

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unit tests for StreamService wiring (credentials provider, status)."""
+import os
 import shutil
 import tempfile
 import time
@@ -173,6 +174,22 @@ class StreamServiceTest(unittest.TestCase):
         service._on_ffmpeg_spawned("gone", orphan, None,
                                    expected_segmenter=FakeSegmenter(0))
         self.assertTrue(orphan.terminated)
+
+    def test_cleanup_old_session_files_removes_suffixed_pipes(self):
+        service = self._service()
+        leftover_pipe = os.path.join(self.tmp_dir, "abcd1234_pipe7")
+        # Pre-upgrade runs left unsuffixed pipes behind; both forms must go.
+        leftover_old_pipe = os.path.join(self.tmp_dir, "abcd1234_pipe")
+        leftover_seg = os.path.join(self.tmp_dir, "abcd1234_seg00001.ts")
+        keeper = os.path.join(self.tmp_dir, "unrelated.txt")
+        for path in (leftover_pipe, leftover_old_pipe, leftover_seg, keeper):
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+        service.cleanup_old_session_files()
+        self.assertFalse(os.path.exists(leftover_pipe))
+        self.assertFalse(os.path.exists(leftover_old_pipe))
+        self.assertFalse(os.path.exists(leftover_seg))
+        self.assertTrue(os.path.exists(keeper))
 
     def test_clean_ffmpeg_exit_notifies_without_crash_count(self):
         service = self._service()

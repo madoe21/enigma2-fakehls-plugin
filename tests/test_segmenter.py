@@ -62,6 +62,14 @@ class SegmenterTest(unittest.TestCase):
     def test_segment_uri_is_relative(self):
         self.assertEqual(self.segmenter.segment_uri(7), "abcd1234_seg00007.ts")
 
+    def test_pipe_path_is_unique_per_segmenter_life(self):
+        # stream_id is a deterministic hash: a re-created stream must not
+        # reuse the previous life's FIFO, or an orphan ffmpeg writes into it.
+        other = stream_service.Segmenter(
+            "abcd1234", FakeSettings(self.tmp_dir), self.logger, seg_duration=2)
+        self.assertNotEqual(self.segmenter.pipe_path, other.pipe_path)
+        self.assertIn("abcd1234_pipe", os.path.basename(self.segmenter.pipe_path))
+
     def test_write_segment_creates_file_and_playlist(self):
         self._write_segments(1)
         self.assertTrue(os.path.exists(self.segmenter.segment_path(0)))
