@@ -29,7 +29,15 @@ if [ -f package.json ]; then
   have npx && npx --no-install eslint . >/dev/null 2>&1 || true
   if grep -q '"test"' package.json; then npm test --silent || fail "npm test failed"; fi
 fi
-[ -f pyproject.toml ] || [ -f requirements.txt ] && { have ruff && { ruff check . || fail "ruff failed"; }; have pytest && { pytest -q || fail "pytest failed"; }; }
+# Prefer `python -m` so user-site installs work without PATH entries;
+# python3-only distros fall back to python3.
+py=python; have python || py=python3
+if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+  if "$py" -m ruff --version >/dev/null 2>&1; then "$py" -m ruff check . || fail "ruff failed"
+  elif have ruff; then ruff check . || fail "ruff failed"; fi
+  if "$py" -m pytest --version >/dev/null 2>&1; then "$py" -m pytest -q || fail "pytest failed"
+  elif have pytest; then pytest -q || fail "pytest failed"; fi
+fi
 [ -f go.mod ] && { [ -z "$(gofmt -l .)" ] || fail "gofmt"; have go && { go vet ./... || true; go test ./... || fail "go test failed"; }; }
 [ -f pubspec.yaml ] && { have dart && dart analyze >/dev/null 2>&1; have flutter && { flutter test || fail "flutter test failed"; }; }
 
