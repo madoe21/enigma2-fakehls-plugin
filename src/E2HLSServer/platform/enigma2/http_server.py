@@ -29,7 +29,7 @@ _WEB_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>E2HLS</title>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/shaka-player@4/dist/shaka-player.compiled.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #0d0d0d; color: #f0f0f0; font-family: sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
@@ -106,19 +106,23 @@ video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: con
   </div>
 </div>
 <script>
-let all = [], filtered = [], cur = -1, listVisible = true, hls = null, bufferTimer = null;
+let all = [], filtered = [], cur = -1, listVisible = true, player = null, bufferTimer = null;
 const PREBUFFER_SECONDS = 12;
 // A single bad segment (e.g. a corrupted keyframe further up the broadcast
-// chain, or a scrambled channel) throws hls.js/MSE into a *fatal* MEDIA_ERROR
-// even though the underlying issue is transient - the native VLC/ffmpeg
-// decoder just skips the bad frame and keeps going, MSE does not. Recovering
-// a few times before giving up gets the same self-healing behaviour switching
-// channels away and back already showed (a fresh MediaSource skips past
-// whatever was stuck) without making the user do that by hand.
+// chain, or a scrambled channel) throws the browser's MSE decoder into a
+// *fatal* error even though the underlying issue is transient - the native
+// VLC/ffmpeg decoder just skips the bad frame and keeps going, MSE does not.
+// Recovering a few times before giving up gets the same self-healing
+// behaviour switching channels away and back already showed (a fresh player
+// load skips past whatever was stuck) without making the user do that by
+// hand. Using Shaka Player here (not hls.js): same underlying browser MSE
+// API either way, so this class of error isn't hls.js-specific, but Shaka's
+// load()/error-event model made the recovery path simpler to get right.
 const MAX_ERROR_RECOVERIES = 4;
 const RECOVERY_RESET_AFTER_MS = 20000;
 let recoveryAttempts = 0;
 let recoveryResetTimer = null;
+let currentHlsUrl = null;
 
 // Hold playback until enough forward buffer exists. Starting immediately on a
 // fresh stream means playing exactly as fast as ffmpeg produces — zero
@@ -142,6 +146,33 @@ function startWhenBuffered(v) {
 }
 
 function onQualityChange() { if (cur >= 0) play(cur); }
+
+function onPlayerError(error) {
+  // RECOVERABLE errors Shaka already retries/continues past internally
+  // (that's the whole point of the severity split); only CRITICAL ones stop
+  // playback and need our own recovery.
+  if (error.severity !== shaka.util.Error.Severity.CRITICAL) return;
+  if (recoveryAttempts >= MAX_ERROR_RECOVERIES) {
+    document.getElementById('loading').classList.remove('show');
+    showMsg('Stream-Fehler: Code ' + error.code + ' (Wiederherstellung fehlgeschlagen)');
+    return;
+  }
+  recoveryAttempts++;
+  if (recoveryResetTimer) clearTimeout(recoveryResetTimer);
+  // A recovery that holds for a while wasn't a fluke - don't let an old
+  // failure count against a channel that's since been fine.
+  recoveryResetTimer = setTimeout(() => { recoveryAttempts = 0; }, RECOVERY_RESET_AFTER_MS);
+  showMsg('Stream-Fehler, stelle wieder her… (' + recoveryAttempts + '/' + MAX_ERROR_RECOVERIES + ')');
+  // Shaka has no single-call "resume from here" like hls.js's
+  // recoverMediaError() - a fresh load() is the documented recovery for a
+  // critical error, same effect as switching channel away and back by hand.
+  if (player && currentHlsUrl) {
+    player.load(currentHlsUrl).then(() => startWhenBuffered(document.getElementById('v'))).catch((e) => {
+      document.getElementById('loading').classList.remove('show');
+      showMsg('Wiederherstellung fehlgeschlagen: ' + (e.message || e));
+    });
+  }
+}
 
 function toggleList() {
   listVisible = !listVisible;
@@ -218,74 +249,42 @@ async function play(i) {
   document.getElementById('loading').classList.add('show');
   document.getElementById('video-area').classList.add('playing');
   v.style.display = 'block';
-  if (hls) { hls.destroy(); hls = null; }
+  if (player) { try { await player.destroy(); } catch(e) {} player = null; }
   v.pause(); v.removeAttribute('src'); v.load();
   try {
     const quality = document.getElementById('quality-select').value;
     // OpenWebInterface-style URL: /<service-ref> starts the stream and
     // redirects to its HLS playlist — same shape as the STB streaming port.
     const hlsUrl = '/' + ch.ref + '?quality=' + quality;
+    currentHlsUrl = hlsUrl;
     document.getElementById('url-bar').style.display = 'flex';
     document.getElementById('url-text').textContent = window.location.origin + '/' + ch.ref;
-    if (Hls.isSupported()) {
-      hls = new Hls({
-        // Sit 6 segments (~12s) behind the live edge; chasing it with only one
-        // buffered segment causes a stall on every segment boundary.
-        liveSyncDurationCount: 6,
-        liveMaxLatencyDurationCount: 18,
-        maxBufferLength: 30,
-        backBufferLength: 30,
-        manifestLoadingTimeOut: 20000,
-        manifestLoadingMaxRetry: 10,
-        manifestLoadingRetryDelay: 500,
-        fragLoadingMaxRetry: 10,
-        levelLoadingMaxRetry: 10,
-        liveSyncOnStallEnabled: true,
+    if (window.shaka && shaka.Player.isBrowserSupported()) {
+      player = new shaka.Player();
+      await player.attach(v);
+      player.configure({
+        streaming: {
+          // Comparable to hls.js's maxBufferLength/backBufferLength.
+          bufferingGoal: 30,
+          bufferBehind: 30,
+          retryParameters: { timeout: 20000, maxAttempts: 10, baseDelay: 500, backoffFactor: 2 },
+        },
+        manifest: {
+          retryParameters: { timeout: 20000, maxAttempts: 10, baseDelay: 500, backoffFactor: 2 },
+        },
       });
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(v);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => startWhenBuffered(v));
-      hls.on(Hls.Events.ERROR, (_, d) => {
-        if (!d.fatal) return;  // non-fatal: hls.js already handles these internally
-        if (recoveryAttempts >= MAX_ERROR_RECOVERIES) {
-          document.getElementById('loading').classList.remove('show');
-          showMsg('Stream-Fehler: ' + d.type + ' (Wiederherstellung fehlgeschlagen)');
-          return;
-        }
-        recoveryAttempts++;
-        if (recoveryResetTimer) clearTimeout(recoveryResetTimer);
-        // A recovery that holds for a while wasn't a fluke - don't let an
-        // old failure count against a channel that's since been fine.
-        recoveryResetTimer = setTimeout(() => { recoveryAttempts = 0; }, RECOVERY_RESET_AFTER_MS);
-        switch (d.type) {
-          case Hls.ErrorTypes.NETWORK_ERROR:
-            showMsg('Netzwerkfehler, versuche erneut… (' + recoveryAttempts + '/' + MAX_ERROR_RECOVERIES + ')');
-            hls.startLoad();
-            break;
-          case Hls.ErrorTypes.MEDIA_ERROR:
-            // The same recovery hls.js recommends for decode errors: reset
-            // the MediaSource/buffers and resume from the current position -
-            // this is what a channel-away-and-back effectively did by hand.
-            showMsg('Decoderfehler, stelle wieder her… (' + recoveryAttempts + '/' + MAX_ERROR_RECOVERIES + ')');
-            hls.recoverMediaError();
-            break;
-          default:
-            // Not network or media (e.g. mux/other) - hls.js has no built-in
-            // recovery for this class, only a fresh instance would help.
-            document.getElementById('loading').classList.remove('show');
-            showMsg('Stream-Fehler: ' + d.type);
-            hls.destroy();
-            hls = null;
-            break;
-        }
-      });
+      player.addEventListener('error', (event) => onPlayerError(event.detail));
+      await player.load(hlsUrl);
+      startWhenBuffered(v);
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
       v.src = hlsUrl;
       v.oncanplay = () => startWhenBuffered(v);
+    } else {
+      throw new Error('Kein unterstützter HLS-Player in diesem Browser gefunden');
     }
   } catch(e) {
     document.getElementById('loading').classList.remove('show');
-    showMsg('Fehler: ' + e.message);
+    showMsg('Fehler: ' + (e.message || e));
   }
   document.getElementById('now').style.display = 'block';
   document.getElementById('now').textContent = ch.name;
@@ -348,7 +347,10 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && Date.now() - lastFsExit < 500) return;
   if (e.key === 'Escape' || e.key === 'Tab') toggleList();
 });
-window.addEventListener('load', loadBouquets);
+window.addEventListener('load', () => {
+  if (window.shaka) shaka.polyfill.installAll();
+  loadBouquets();
+});
 </script>
 </body>
 </html>"""

@@ -8,6 +8,13 @@ import threading
 import urllib.parse
 
 
+# Must approximate stream_service.py's filler runway (2 filler segments at
+# its _FILLER_DURATION each) - see build_ffmpeg_cmd's -output_ts_offset.
+# Not imported from there directly: ffmpeg_service <- stream_service already,
+# importing back would be circular. Keep the two in sync by hand.
+_FILLER_RUNWAY_OFFSET_SECONDS = 4.0
+
+
 def mask_credentials(url):
     """Log-safe form of a stream URL — embedded credentials stripped."""
     return re.sub(r"//[^/@]+@", "//***@", url)
@@ -101,6 +108,17 @@ def build_ffmpeg_cmd(stream_url, output_pipe, settings, e2_user=None, e2_pass=No
         "192k",
         "-copyts",
         "-start_at_zero",
+        # Real content's clock would otherwise restart at ~0 while the
+        # bundled filler (see stream_service.py's Segmenter) already ran the
+        # playlist's clock up to ~2x its own duration - a *backwards* PTS
+        # jump at the filler->real boundary, on top of the discontinuity
+        # itself. Offsetting past the common case (2 filler segments) turns
+        # that into a small forward gap instead; #EXT-X-DISCONTINUITY is
+        # still the authoritative signal for players that need an exact
+        # reset, this just makes the common case less jarring for those that
+        # are more lenient about it.
+        "-output_ts_offset",
+        str(_FILLER_RUNWAY_OFFSET_SECONDS),
         "-f",
         "mpegts",
         "-y",
