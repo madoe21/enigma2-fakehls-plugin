@@ -47,6 +47,9 @@ class FakeLogger(object):
     def log_ffmpeg_exit(self, _stream_id, _retcode, _log_file=None):
         pass
 
+    def log_stream_stop(self, _stream_id, _reason="normal"):
+        pass
+
 
 class FakeReactor(object):
     def __init__(self):
@@ -68,6 +71,15 @@ class FakeSegmenter(object):
 
     def notify_writer_exited(self):
         self.writer_exit_notified = True
+
+    def stop(self):
+        pass
+
+    def is_alive(self):
+        return False
+
+    def cleanup_all(self):
+        pass
 
 
 class StreamServiceTest(unittest.TestCase):
@@ -240,6 +252,33 @@ class StreamServiceTest(unittest.TestCase):
         service._on_ffmpeg_spawned("gone", orphan, None,
                                    expected_segmenter=FakeSegmenter(0))
         self.assertTrue(orphan.terminated)
+
+    def test_stop_stream_removes_ffmpeg_log(self):
+        # Regression: <id>_ffmpeg.log was never deleted on stream stop, so
+        # every distinct channel ever watched left a permanent orphan file
+        # in tmpfs.
+        service = self._service()
+        log_dir = os.path.join(self.tmp_dir, "logs")
+        os.makedirs(log_dir)
+        log_path = os.path.join(log_dir, "abcd1234_ffmpeg.log")
+        with open(log_path, "wb") as handle:
+            handle.write(b"ffmpeg output")
+        service.streams["abcd1234"] = self._stream_entry(FakeSegmenter(0))
+        service._stop_stream("abcd1234", delete_files=True)
+        self.assertFalse(os.path.exists(log_path))
+
+    def test_cleanup_old_session_files_removes_stale_ffmpeg_logs(self):
+        service = self._service()
+        log_dir = os.path.join(self.tmp_dir, "logs")
+        os.makedirs(log_dir)
+        stale_log = os.path.join(log_dir, "deadbeef_ffmpeg.log")
+        plugin_log = os.path.join(log_dir, "plugin.log")
+        for path in (stale_log, plugin_log):
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+        service.cleanup_old_session_files()
+        self.assertFalse(os.path.exists(stale_log))
+        self.assertTrue(os.path.exists(plugin_log))
 
     def test_cleanup_old_session_files_removes_suffixed_pipes(self):
         service = self._service()
