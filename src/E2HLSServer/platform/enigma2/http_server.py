@@ -15,10 +15,11 @@ from twisted.web.server import NOT_DONE_YET, Site
 from .config import HTML_TEMPLATE_FILE, get_favicon_path
 
 try:
-    from enigma import eServiceCenter, eServiceReference
+    from enigma import eServiceCenter, eServiceReference, eEPGCache
 except ImportError:  # not running inside enigma2 (dev machine, tests)
     eServiceCenter = None
     eServiceReference = None
+    eEPGCache = None
 
 # enigma2 stores the channel lists (bouquets) as plain text files here.
 BOUQUET_DIR = "/etc/enigma2"
@@ -57,7 +58,9 @@ video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: con
 #placeholder { color: #444; font-size: 1rem; text-align: center; line-height: 2.2; }
 #toggle-list { position: absolute; top: 50%; left: 0; transform: translateY(-50%); z-index: 10; background: rgba(0,0,0,0.7); border: 1px solid #333; border-left: none; border-radius: 0 6px 6px 0; color: #aaa; font-size: 1.1rem; width: 22px; height: 56px; cursor: pointer; display: flex; align-items: center; justify-content: center; user-select: none; }
 #toggle-list:hover { background: rgba(0,204,136,0.2); color: #00cc88; }
-#now { position: absolute; top: 0.8rem; left: 0.8rem; background: rgba(0,0,0,0.75); border: 1px solid #00cc88; border-radius: 3px; padding: 0.3rem 0.7rem; font-size: 0.85rem; color: #00cc88; display: none; }
+#now { position: absolute; top: 0.8rem; left: 0.8rem; max-width: 46vw; background: rgba(0,0,0,0.75); border: 1px solid #00cc88; border-radius: 3px; padding: 0.35rem 0.7rem; font-size: 0.85rem; color: #00cc88; display: none; }
+#now-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.epg-line { font-size: 0.72rem; color: #7fd9b6; margin-top: 0.2rem; font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #loading { position: absolute; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; flex-direction: column; gap: 1rem; }
 #loading.show { display: flex; }
 .spinner { width: 40px; height: 40px; border: 3px solid rgba(0,204,136,0.2); border-top-color: #00cc88; border-radius: 50%; animation: spin 0.8s linear infinite; }
@@ -94,7 +97,11 @@ video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: con
       <div id="placeholder">Lade Senderliste&#8230;</div>
       <video id="v" controls style="display:none"></video>
       <button id="fullscreen-btn" onclick="toggleFullscreen()" title="Vollbild (Escape beendet)">&#x26F6;</button>
-      <div id="now"></div>
+      <div id="now">
+        <div id="now-title"></div>
+        <div id="epg-now" class="epg-line"></div>
+        <div id="epg-next" class="epg-line"></div>
+      </div>
       <div id="loading"><div class="spinner"></div><span id="loading-text" style="color:#aaa;font-size:0.9rem">Starte Stream&#8230;</span></div>
       <div id="msg"></div>
     </div>
@@ -107,6 +114,8 @@ video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: con
 </div>
 <script>
 let all = [], filtered = [], cur = -1, listVisible = true, player = null, bufferTimer = null;
+let epgRefreshTimer = null;
+const EPG_REFRESH_MS = 60000;
 const PREBUFFER_SECONDS = 12;
 // A single bad segment (e.g. a corrupted keyframe further up the broadcast
 // chain, or a scrambled channel) throws the browser's MSE decoder into a
@@ -299,12 +308,34 @@ async function waitUntilReady(streamId, maxWaitMs) {
   return false;
 }
 
+function fmtEpg(ev) {
+  const t = d => d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+  return t(new Date(ev.begin * 1000)) + '–' + t(new Date(ev.end * 1000)) + ' ' + ev.title;
+}
+
+// EPG for the currently selected channel only - no bulk lookups. Re-polled
+// every EPG_REFRESH_MS while a channel stays selected so "jetzt" doesn't go
+// stale once the current programme ends.
+async function updateEpg(ref) {
+  const nowEl = document.getElementById('epg-now');
+  const nextEl = document.getElementById('epg-next');
+  try {
+    const r = await fetch('/api/epg?ref=' + encodeURIComponent(ref));
+    const data = await r.json();
+    nowEl.textContent = data.now ? fmtEpg(data.now) : '';
+    nextEl.textContent = data.next ? ('Danach: ' + fmtEpg(data.next)) : '';
+  } catch (e) {
+    nowEl.textContent = ''; nextEl.textContent = '';
+  }
+}
+
 async function play(i) {
   cur = i;
   const ch = filtered[i];
   const v = document.getElementById('v');
   if (bufferTimer) { clearInterval(bufferTimer); bufferTimer = null; }
   if (recoveryResetTimer) { clearTimeout(recoveryResetTimer); recoveryResetTimer = null; }
+  if (epgRefreshTimer) { clearInterval(epgRefreshTimer); epgRefreshTimer = null; }
   disarmStallWatchdog();
   recoveryAttempts = 0;
   document.getElementById('placeholder').style.display = 'none';
@@ -359,8 +390,10 @@ async function play(i) {
     showMsg('Fehler: ' + (e.message || e));
   }
   document.getElementById('now').style.display = 'block';
-  document.getElementById('now').textContent = ch.name;
+  document.getElementById('now-title').textContent = ch.name;
   document.title = ch.name + ' — E2HLS';
+  updateEpg(ch.ref);
+  epgRefreshTimer = setInterval(() => updateEpg(ch.ref), EPG_REFRESH_MS);
   renderList();
   document.querySelectorAll('.ch')[i]?.scrollIntoView({block:'nearest'});
 }
@@ -489,6 +522,8 @@ class HlsRoot(Resource):
             return self.render_api_start(request)
         if path == "/api/ready":
             return self.render_api_ready(request)
+        if path == "/api/epg":
+            return self.render_api_epg(request)
 
         # OpenWebInterface-style streaming: http://<box-ip>:<port>/<service-ref>
         # (same URL shape as the STB streaming port, just HLS on this port).
@@ -917,6 +952,43 @@ class HlsRoot(Resource):
         return self._json_response(request, {
             "ready": self.stream_service.has_real_data(stream_id),
         })
+
+    def _epg_event_dict(self, event):
+        if event is None:
+            return None
+        begin = event.getBeginTime()
+        duration = event.getDuration()
+        return {
+            "title": event.getEventName() or "",
+            "begin": begin,
+            "end": begin + duration,
+        }
+
+    def render_api_epg(self, request):
+        """Now/next EPG info for a single service ref (the currently
+        selected channel only — not a bulk lookup)."""
+        ref_raw = request.args.get(b"ref", [None])[0]
+        if not ref_raw:
+            return self._json_response(request, {"error": "Missing ref"}, 400)
+        ref = urllib.parse.unquote(ref_raw.decode())
+        if eEPGCache is None or eServiceReference is None:
+            return self._json_response(request, {"now": None, "next": None})
+        try:
+            service = eServiceReference(ref)
+            epgcache = eEPGCache.getInstance()
+            now_event = epgcache.lookupEventTime(service, -1, 0)
+            if now_event is not None:
+                next_event = epgcache.lookupEventTime(
+                    service, now_event.getBeginTime() + now_event.getDuration(), +1)
+            else:
+                next_event = epgcache.lookupEventTime(service, -1, +1)
+            return self._json_response(request, {
+                "now": self._epg_event_dict(now_event),
+                "next": self._epg_event_dict(next_event),
+            })
+        except Exception as exc:
+            self.logger.debug("EPG lookup failed for %s: %s" % (ref, exc))
+            return self._json_response(request, {"now": None, "next": None})
 
     def render_web(self, request):
         request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
