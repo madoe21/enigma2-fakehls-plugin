@@ -227,11 +227,35 @@ class Segmenter(threading.Thread):
         # follow it, or TARGETDURATION would have to shrink after the fact.
         self._target_duration = max(self._target_duration, int(_FILLER_DURATION) + 1)
         self._filler_bytes = _load_filler_bytes(logger)
+        self._last_filler_at = None
 
         self.hls_dir = settings.hls_dir()
         self.pipe_path = os.path.join(
             self.hls_dir, stream_id + "_pipe" + str(next(_PIPE_SEQUENCE)))
         self.playlist = os.path.join(self.hls_dir, "live_" + stream_id + ".m3u8")
+
+    def write_initial_segment(self):
+        """Write the filler as segment 0 synchronously, before this thread
+        even starts. Call this from the request-handling thread right after
+        construction so the playlist file - and therefore a redirect target
+        the HTTP handler can use *immediately, with no polling* - exists
+        before get_or_create_stream() returns.
+
+        This existed as an async, polled step before (the HTTP handler
+        waited on reactor.callLater ticks for the playlist to appear) but
+        that polling turned out to be unreliable here: enigma2's reactor
+        integration services callLater ticks on the order of ~10s, not the
+        0.25s they're scheduled for, so a client could still time out
+        waiting on ticks that were individually fine but arrived far too
+        slowly in wall time. Making this synchronous removes the dependency
+        on the reactor's timer granularity for the part that actually needs
+        to be fast.
+        """
+        if self._filler_bytes is None:
+            return False
+        self._write_segment(self._filler_bytes, _FILLER_DURATION)
+        self._last_filler_at = time.time()
+        return True
 
     def stop(self):
         self._stop_event.set()
@@ -307,20 +331,15 @@ class Segmenter(threading.Thread):
         self._grow_pipe_buffer(pipe_fd)
         cutter = SegmentCutter(self._seg_duration, logger=self.logger)
         got_data = False
-        # None = "no filler written yet"; set on every filler write so the
-        # cadence below is measured from the last emission, not wall time
-        # since stream start.
-        last_filler_at = None
 
-        # Serve *something* the instant a client asks: a cold ffmpeg start
-        # (spawn + probe + sync to the first keyframe) can legitimately run
-        # into the tens of seconds on the receiver's CPU, and VLC/browsers
-        # have no reason to keep retrying a request that never got a single
-        # byte back. The bundled filler clip makes the playlist exist (and
-        # the client start playing black+silence) within milliseconds;
-        # playback continues into the real stream the moment ffmpeg catches
-        # up, with no visible error or manual retry needed.
-        last_filler_at = self._maybe_emit_filler(got_data, last_filler_at, force=True)
+        # write_initial_segment() (called by the request handler before this
+        # thread even started) already wrote segment 0 as filler, so the
+        # playlist exists and self._last_filler_at is set. Keep re-emitting
+        # on the same cadence while still waiting for real ffmpeg data - a
+        # cold ffmpeg start (spawn + probe + sync to the first keyframe) can
+        # legitimately run into the tens of seconds on the receiver's CPU.
+        if self._last_filler_at is None:
+            self._maybe_emit_filler(got_data, force=True)
 
         try:
             while not self.stopped():
@@ -329,7 +348,7 @@ class Segmenter(threading.Thread):
                 except BlockingIOError:
                     # Writer attached but no data right now — wait, bounded
                     # so stop() is honoured within a second.
-                    last_filler_at = self._maybe_emit_filler(got_data, last_filler_at)
+                    self._maybe_emit_filler(got_data)
                     select.select([pipe_fd], [], [], 1.0)
                     continue
                 except OSError as exc:
@@ -345,7 +364,7 @@ class Segmenter(threading.Thread):
                         break
                     if self._writer_exited.is_set():
                         break
-                    last_filler_at = self._maybe_emit_filler(got_data, last_filler_at)
+                    self._maybe_emit_filler(got_data)
                     time.sleep(0.1)
                     continue
                 got_data = True
@@ -361,18 +380,17 @@ class Segmenter(threading.Thread):
                 for data, duration in cutter.flush():
                     self._write_segment(data, duration)
 
-    def _maybe_emit_filler(self, got_data, last_filler_at, force=False):
+    def _maybe_emit_filler(self, got_data, force=False):
         """Write another filler segment if real data hasn't started yet and
-        the previous one is due to run out. Returns the (possibly updated)
-        last-emit timestamp. No-op once got_data is True or no filler asset
-        was bundled/loadable."""
+        the previous one is due to run out (self._last_filler_at). No-op
+        once got_data is True or no filler asset was bundled/loadable."""
         if got_data or self._filler_bytes is None or self.stopped():
-            return last_filler_at
+            return
         now = time.time()
-        if not force and last_filler_at is not None and now - last_filler_at < _FILLER_DURATION:
-            return last_filler_at
+        if not force and self._last_filler_at is not None and now - self._last_filler_at < _FILLER_DURATION:
+            return
         self._write_segment(self._filler_bytes, _FILLER_DURATION)
-        return now
+        self._last_filler_at = now
 
     def _write_segment(self, data, duration):
         if len(data) < 8 * 1024:
@@ -550,6 +568,12 @@ class StreamService(object):
         segmenter = Segmenter(stream_id, self.settings, self.logger,
                               seg_duration=preset["seg_duration"])
         segmenter.create_pipe()
+        # Synchronous and cheap (one 36 KB file write): guarantees the
+        # playlist exists, and therefore that the caller can redirect
+        # immediately with no polling, before this call returns. See
+        # write_initial_segment()'s docstring for why polling isn't reliable
+        # enough here to do this step asynchronously instead.
+        segmenter.write_initial_segment()
 
         stream_url = build_stream_url(effective_params, self.settings)
         self.logger.info("Stream " + stream_id + " input: " + mask_credentials(stream_url))
@@ -585,8 +609,8 @@ class StreamService(object):
         )
 
         # The segmenter runs in its own thread and consumes the pipe until
-        # ffmpeg exits.  It must be started *before* returning so the
-        # playlist file exists when the first client polls for it.
+        # ffmpeg exits, continuing the filler cadence (if still waiting) or
+        # cutting real segments once data arrives.
         segmenter.start()
 
         return stream_id, True
