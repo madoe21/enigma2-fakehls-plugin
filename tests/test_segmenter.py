@@ -93,6 +93,32 @@ class SegmenterTest(unittest.TestCase):
         self.assertIn("abcd1234_seg00002.ts", content)
         self.assertIn("abcd1234_seg00004.ts", content)
 
+    def test_write_initial_segment_is_flagged_as_filler(self):
+        # Regression: write_initial_segment() forgot to pass is_filler=True
+        # for a while, so the very first (filler) segment looked like real
+        # content to has_real_data() / the discontinuity-detection in
+        # _update_playlist - the web player would then load the filler
+        # thinking it was live content (no #EXT-X-DISCONTINUITY to warn it),
+        # producing exactly the audio/video desync a player has no way to
+        # recover from on its own.
+        self.segmenter._filler_bytes = bytes(16 * 1024)
+        self.assertTrue(self.segmenter.write_initial_segment())
+        self.assertEqual(len(self.segmenter.segments), 1)
+        is_filler = self.segmenter.segments[0][4]
+        self.assertTrue(is_filler, "initial segment must be flagged as filler")
+
+    def test_discontinuity_tag_at_filler_to_real_boundary(self):
+        self.segmenter._filler_bytes = bytes(16 * 1024)
+        self.segmenter.write_initial_segment()
+        self._write_segments(1)  # a real segment via the normal path
+        content = self._playlist_content()
+        self.assertIn("#EXT-X-DISCONTINUITY", content)
+        # The tag must sit between the filler and the real segment's URI.
+        filler_pos = content.index("abcd1234_seg00000.ts")
+        disc_pos = content.index("#EXT-X-DISCONTINUITY")
+        real_pos = content.index("abcd1234_seg00001.ts")
+        self.assertTrue(filler_pos < disc_pos < real_pos)
+
     def test_old_segment_files_are_deleted(self):
         self._write_segments(6)
         # keep = 2 * playlist_size = 6 newest files (RFC 8216 §6.2.2)

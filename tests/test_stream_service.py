@@ -116,6 +116,26 @@ class StreamServiceTest(unittest.TestCase):
         self.assertEqual(status["abcd1234"]["access_count"], 2)
         self.assertEqual(status["abcd1234"]["hls_url"], "/hls/live_abcd1234.m3u8")
 
+    def test_has_real_data_false_when_only_filler_segment(self):
+        # Regression: has_real_data() must not be fooled by the synchronous
+        # initial filler segment (is_filler=True at tuple index 4).
+        service = self._service()
+        segmenter = FakeSegmenter(segment_count=0)
+        segmenter.segments = [(0, "p0", 0, 2.0, True)]
+        service.streams["abcd1234"] = {"segmenter": segmenter}
+        self.assertFalse(service.has_real_data("abcd1234"))
+
+    def test_has_real_data_true_once_real_segment_appended(self):
+        service = self._service()
+        segmenter = FakeSegmenter(segment_count=0)
+        segmenter.segments = [(0, "p0", 0, 2.0, True), (1, "p1", 0, 2.0, False)]
+        service.streams["abcd1234"] = {"segmenter": segmenter}
+        self.assertTrue(service.has_real_data("abcd1234"))
+
+    def test_has_real_data_false_for_unknown_stream(self):
+        service = self._service()
+        self.assertFalse(service.has_real_data("gone"))
+
     def test_marshal_routes_callback_through_reactor(self):
         service = self._service()
         calls = []
