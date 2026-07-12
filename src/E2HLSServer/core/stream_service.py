@@ -389,10 +389,10 @@ class Segmenter(threading.Thread):
         now = time.time()
         if not force and self._last_filler_at is not None and now - self._last_filler_at < _FILLER_DURATION:
             return
-        self._write_segment(self._filler_bytes, _FILLER_DURATION)
+        self._write_segment(self._filler_bytes, _FILLER_DURATION, is_filler=True)
         self._last_filler_at = now
 
-    def _write_segment(self, data, duration):
+    def _write_segment(self, data, duration, is_filler=False):
         if len(data) < 8 * 1024:
             return
 
@@ -403,7 +403,7 @@ class Segmenter(threading.Thread):
             with open(seg_path, "wb") as handle:
                 handle.write(data)
 
-            self.segments.append((self.segment_index, seg_path, created_at, duration))
+            self.segments.append((self.segment_index, seg_path, created_at, duration, is_filler))
             self.segment_index += 1
             self._update_playlist()
             # Once per segment is enough; running this per 64 KB chunk was
@@ -426,7 +426,19 @@ class Segmenter(threading.Thread):
             content += "#EXT-X-TARGETDURATION:" + str(self._target_duration) + "\n"
             content += "#EXT-X-MEDIA-SEQUENCE:" + str(first_seq) + "\n"
 
-            for idx, _seg_path, _created_at, duration in active:
+            # The filler clip is an independently-encoded standalone file with
+            # its own SPS/PPS and its own PTS/DTS timeline; real segments use
+            # -copyts -start_at_zero, a completely different timeline. Playing
+            # one straight into the other without announcing it is a
+            # timestamp discontinuity - MSE (hls.js et al.) reject the
+            # appendBuffer() for that as a decode error; native players
+            # (VLC/libavcodec) just resync and carry on, which is why this
+            # only ever showed up as "the web player" being broken.
+            previous_kind = None
+            for idx, _seg_path, _created_at, duration, is_filler in active:
+                if previous_kind is not None and is_filler != previous_kind:
+                    content += "#EXT-X-DISCONTINUITY\n"
+                previous_kind = is_filler
                 content += "#EXTINF:%.3f,\n" % duration
                 content += self.segment_uri(idx) + "\n"
 
@@ -445,7 +457,7 @@ class Segmenter(threading.Thread):
         # playlist size to cover the window safely (cheap on tmpfs).
         keep = 2 * self.settings.playlist_size()
         if len(self.segments) > keep:
-            for _idx, seg_path, _created_at, _duration in self.segments[:-keep]:
+            for _idx, seg_path, _created_at, _duration, _is_filler in self.segments[:-keep]:
                 try:
                     if os.path.exists(seg_path):
                         os.unlink(seg_path)
@@ -454,7 +466,7 @@ class Segmenter(threading.Thread):
             self.segments = self.segments[-keep:]
 
     def cleanup_all(self):
-        for _idx, seg_path, _created_at, _duration in self.segments:
+        for _idx, seg_path, _created_at, _duration, _is_filler in self.segments:
             try:
                 if os.path.exists(seg_path):
                     os.unlink(seg_path)
