@@ -108,6 +108,17 @@ video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: con
 <script>
 let all = [], filtered = [], cur = -1, listVisible = true, hls = null, bufferTimer = null;
 const PREBUFFER_SECONDS = 12;
+// A single bad segment (e.g. a corrupted keyframe further up the broadcast
+// chain, or a scrambled channel) throws hls.js/MSE into a *fatal* MEDIA_ERROR
+// even though the underlying issue is transient - the native VLC/ffmpeg
+// decoder just skips the bad frame and keeps going, MSE does not. Recovering
+// a few times before giving up gets the same self-healing behaviour switching
+// channels away and back already showed (a fresh MediaSource skips past
+// whatever was stuck) without making the user do that by hand.
+const MAX_ERROR_RECOVERIES = 4;
+const RECOVERY_RESET_AFTER_MS = 20000;
+let recoveryAttempts = 0;
+let recoveryResetTimer = null;
 
 // Hold playback until enough forward buffer exists. Starting immediately on a
 // fresh stream means playing exactly as fast as ffmpeg produces — zero
@@ -200,6 +211,8 @@ async function play(i) {
   const ch = filtered[i];
   const v = document.getElementById('v');
   if (bufferTimer) { clearInterval(bufferTimer); bufferTimer = null; }
+  if (recoveryResetTimer) { clearTimeout(recoveryResetTimer); recoveryResetTimer = null; }
+  recoveryAttempts = 0;
   document.getElementById('placeholder').style.display = 'none';
   document.getElementById('loading-text').textContent = 'Starte Stream…';
   document.getElementById('loading').classList.add('show');
@@ -222,7 +235,6 @@ async function play(i) {
         liveMaxLatencyDurationCount: 18,
         maxBufferLength: 30,
         backBufferLength: 30,
-        // the root route holds the request until the playlist exists (up to 10s)
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 10,
         manifestLoadingRetryDelay: 500,
@@ -234,9 +246,37 @@ async function play(i) {
       hls.attachMedia(v);
       hls.on(Hls.Events.MANIFEST_PARSED, () => startWhenBuffered(v));
       hls.on(Hls.Events.ERROR, (_, d) => {
-        if (d.fatal) {
+        if (!d.fatal) return;  // non-fatal: hls.js already handles these internally
+        if (recoveryAttempts >= MAX_ERROR_RECOVERIES) {
           document.getElementById('loading').classList.remove('show');
-          showMsg('Stream-Fehler: ' + d.type);
+          showMsg('Stream-Fehler: ' + d.type + ' (Wiederherstellung fehlgeschlagen)');
+          return;
+        }
+        recoveryAttempts++;
+        if (recoveryResetTimer) clearTimeout(recoveryResetTimer);
+        // A recovery that holds for a while wasn't a fluke - don't let an
+        // old failure count against a channel that's since been fine.
+        recoveryResetTimer = setTimeout(() => { recoveryAttempts = 0; }, RECOVERY_RESET_AFTER_MS);
+        switch (d.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            showMsg('Netzwerkfehler, versuche erneut… (' + recoveryAttempts + '/' + MAX_ERROR_RECOVERIES + ')');
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            // The same recovery hls.js recommends for decode errors: reset
+            // the MediaSource/buffers and resume from the current position -
+            // this is what a channel-away-and-back effectively did by hand.
+            showMsg('Decoderfehler, stelle wieder her… (' + recoveryAttempts + '/' + MAX_ERROR_RECOVERIES + ')');
+            hls.recoverMediaError();
+            break;
+          default:
+            // Not network or media (e.g. mux/other) - hls.js has no built-in
+            // recovery for this class, only a fresh instance would help.
+            document.getElementById('loading').classList.remove('show');
+            showMsg('Stream-Fehler: ' + d.type);
+            hls.destroy();
+            hls = null;
+            break;
         }
       });
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
