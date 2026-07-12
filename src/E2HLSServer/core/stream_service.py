@@ -172,6 +172,35 @@ class SegmentCutter(object):
 _PIPE_SEQUENCE = itertools.count()
 
 
+_FILLER_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "filler.ts")
+# Must match the actual encoded duration of assets/filler.ts (currently a
+# 2 s black+silence clip - see assets/README.md for the ffmpeg command that
+# generated it). Used both as the EXTINF for each filler entry and as the
+# cadence for re-emitting it while still waiting for ffmpeg.
+_FILLER_DURATION = 2.0
+_filler_bytes_cache = None
+_filler_load_attempted = False
+
+
+def _load_filler_bytes(logger=None):
+    """Bundled placeholder segment, read once and cached for the process
+    lifetime (it's ~36 KB and never changes at runtime)."""
+    global _filler_bytes_cache, _filler_load_attempted
+    if _filler_load_attempted:
+        return _filler_bytes_cache
+    _filler_load_attempted = True
+    try:
+        with open(_FILLER_PATH, "rb") as handle:
+            _filler_bytes_cache = handle.read()
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("Segmenter: filler asset unavailable (" + str(exc)
+                            + ") - first request will wait on ffmpeg like before")
+        _filler_bytes_cache = None
+    return _filler_bytes_cache
+
+
 class Segmenter(threading.Thread):
     PIPE_READ_SIZE = 65536
     # Default FIFO capacity (64 KB) is ~65 ms of an 8 Mbit/s TS: any stall in
@@ -194,6 +223,10 @@ class Segmenter(threading.Thread):
         # RFC 8216 §6.2.1: EXT-X-TARGETDURATION must not change between
         # reloads — keep a never-decreasing value instead of the window max.
         self._target_duration = int(self._seg_duration) + 1
+        # A live-video filler must not be shorter than the segments that
+        # follow it, or TARGETDURATION would have to shrink after the fact.
+        self._target_duration = max(self._target_duration, int(_FILLER_DURATION) + 1)
+        self._filler_bytes = _load_filler_bytes(logger)
 
         self.hls_dir = settings.hls_dir()
         self.pipe_path = os.path.join(
@@ -274,6 +307,20 @@ class Segmenter(threading.Thread):
         self._grow_pipe_buffer(pipe_fd)
         cutter = SegmentCutter(self._seg_duration, logger=self.logger)
         got_data = False
+        # None = "no filler written yet"; set on every filler write so the
+        # cadence below is measured from the last emission, not wall time
+        # since stream start.
+        last_filler_at = None
+
+        # Serve *something* the instant a client asks: a cold ffmpeg start
+        # (spawn + probe + sync to the first keyframe) can legitimately run
+        # into the tens of seconds on the receiver's CPU, and VLC/browsers
+        # have no reason to keep retrying a request that never got a single
+        # byte back. The bundled filler clip makes the playlist exist (and
+        # the client start playing black+silence) within milliseconds;
+        # playback continues into the real stream the moment ffmpeg catches
+        # up, with no visible error or manual retry needed.
+        last_filler_at = self._maybe_emit_filler(got_data, last_filler_at, force=True)
 
         try:
             while not self.stopped():
@@ -282,6 +329,7 @@ class Segmenter(threading.Thread):
                 except BlockingIOError:
                     # Writer attached but no data right now — wait, bounded
                     # so stop() is honoured within a second.
+                    last_filler_at = self._maybe_emit_filler(got_data, last_filler_at)
                     select.select([pipe_fd], [], [], 1.0)
                     continue
                 except OSError as exc:
@@ -297,6 +345,7 @@ class Segmenter(threading.Thread):
                         break
                     if self._writer_exited.is_set():
                         break
+                    last_filler_at = self._maybe_emit_filler(got_data, last_filler_at)
                     time.sleep(0.1)
                     continue
                 got_data = True
@@ -311,6 +360,19 @@ class Segmenter(threading.Thread):
             if not self.stopped():
                 for data, duration in cutter.flush():
                     self._write_segment(data, duration)
+
+    def _maybe_emit_filler(self, got_data, last_filler_at, force=False):
+        """Write another filler segment if real data hasn't started yet and
+        the previous one is due to run out. Returns the (possibly updated)
+        last-emit timestamp. No-op once got_data is True or no filler asset
+        was bundled/loadable."""
+        if got_data or self._filler_bytes is None or self.stopped():
+            return last_filler_at
+        now = time.time()
+        if not force and last_filler_at is not None and now - last_filler_at < _FILLER_DURATION:
+            return last_filler_at
+        self._write_segment(self._filler_bytes, _FILLER_DURATION)
+        return now
 
     def _write_segment(self, data, duration):
         if len(data) < 8 * 1024:
