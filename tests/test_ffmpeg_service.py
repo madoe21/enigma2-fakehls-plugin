@@ -104,6 +104,58 @@ class BuildStreamUrlTest(unittest.TestCase):
         self.assertIn("@127.0.0.1:8001/", url)
         self.assertNotIn("p@ss:w@127", url)  # raw '@'/':' must be quoted
 
+    def test_uses_stream_relay_true_for_whitelisted_ref(self):
+        settings = FakeSettings(relay_refs=[WHITELISTED_REF])
+        self.assertTrue(ffmpeg_service.uses_stream_relay(WHITELISTED_REF, settings))
+
+    def test_uses_stream_relay_false_for_plain_ref(self):
+        settings = FakeSettings(relay_refs=[WHITELISTED_REF])
+        self.assertFalse(ffmpeg_service.uses_stream_relay(PLAIN_REF, settings))
+
+    def test_uses_stream_relay_false_without_relay_support(self):
+        self.assertFalse(ffmpeg_service.uses_stream_relay(PLAIN_REF, MinimalSettings()))
+
+
+class ResolveHwStreamUrlTest(unittest.TestCase):
+    """resolve_hw_stream_url() - OpenWebif session-token resolution."""
+
+    def _urlopen_returning(self, body):
+        response = mock.MagicMock()
+        response.read.return_value = body.encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        return mock.Mock(return_value=response)
+
+    def test_extracts_url_line_from_m3u_body(self):
+        body = ("#EXTM3U \n#EXTVLCOPT:http-reconnect=true \n"
+                 "http://-sid:abc123@127.0.0.1:8002/" + PLAIN_REF + "\n")
+        with mock.patch.object(ffmpeg_service.urllib.request, "urlopen",
+                                self._urlopen_returning(body)):
+            url = ffmpeg_service.resolve_hw_stream_url(PLAIN_REF, FakeSettings())
+        self.assertEqual(url, "http://-sid:abc123@127.0.0.1:8002/" + PLAIN_REF)
+
+    def test_raises_when_no_url_in_response(self):
+        with mock.patch.object(ffmpeg_service.urllib.request, "urlopen",
+                                self._urlopen_returning("Missing file parameter")):
+            with self.assertRaises(RuntimeError):
+                ffmpeg_service.resolve_hw_stream_url(PLAIN_REF, FakeSettings())
+
+    def test_propagates_connection_failure(self):
+        with mock.patch.object(ffmpeg_service.urllib.request, "urlopen",
+                                mock.Mock(side_effect=OSError("connection refused"))):
+            with self.assertRaises(OSError):
+                ffmpeg_service.resolve_hw_stream_url(PLAIN_REF, FakeSettings())
+
+    def test_adds_basic_auth_header_when_credentials_given(self):
+        body = "http://-sid:abc123@127.0.0.1:8002/" + PLAIN_REF + "\n"
+        opener = self._urlopen_returning(body)
+        with mock.patch.object(ffmpeg_service.urllib.request, "urlopen", opener):
+            ffmpeg_service.resolve_hw_stream_url(
+                PLAIN_REF, FakeSettings(), e2_user="root", e2_pass="secret")
+        request = opener.call_args[0][0]
+        self.assertEqual(request.get_header("Authorization"),
+                          "Basic " + ffmpeg_service.base64.b64encode(b"root:secret").decode())
+
 
 class SpawnSettings(object):
     """Minimal settings for the spawn path (build_ffmpeg_cmd)."""
@@ -182,6 +234,48 @@ class AsyncStartFfmpegTest(unittest.TestCase):
     def test_logger_none_stays_silent_and_functional(self):
         self._start(None, mock.Mock(return_value=FakeProcess()))
         self.assertIsNotNone(self.got["process"])  # callbacks unaffected
+
+    def test_hw_ref_resolves_url_before_spawning(self):
+        # The resolved (session-token) URL, not the placeholder passed in,
+        # must end up in the actual ffmpeg command line.
+        logger = RecordingLogger()
+        popen = mock.Mock(return_value=FakeProcess(retcode=0))
+        resolved = "http://-sid:tok123@127.0.0.1:8002/ref"
+        with mock.patch.object(ffmpeg_service, "resolve_hw_stream_url",
+                                return_value=resolved) as resolve:
+            with mock.patch.object(ffmpeg_service.subprocess, "Popen", popen):
+                ffmpeg_service.async_start_ffmpeg(
+                    "http://127.0.0.1:8002/ref", "/tmp/pipe", "sid1",
+                    self.log_dir, SpawnSettings(),
+                    on_ready=self._on_ready, on_exit=self._on_exit,
+                    logger=logger, hw_ref="ref",
+                    e2_user="root", e2_pass="secret")
+                self.assertTrue(self.ready.wait(timeout=3), "on_ready not called")
+        resolve.assert_called_once_with(
+            "ref", mock.ANY, e2_user="root", e2_pass="secret")
+        cmd = popen.call_args[0][0]
+        self.assertIn(resolved, cmd)
+        # The resolved URL carries its own session auth; an explicit
+        # Authorization header would override and break it.
+        self.assertNotIn("-headers", cmd)
+        self.assertTrue(any("mode=hw" in msg for msg in logger.infos))
+
+    def test_hw_ref_resolution_failure_reports_none_process_and_never_spawns(self):
+        logger = RecordingLogger()
+        popen = mock.Mock(return_value=FakeProcess())
+        with mock.patch.object(ffmpeg_service, "resolve_hw_stream_url",
+                                side_effect=RuntimeError("no transcoder")):
+            with mock.patch.object(ffmpeg_service.subprocess, "Popen", popen):
+                ffmpeg_service.async_start_ffmpeg(
+                    "http://127.0.0.1:8002/ref", "/tmp/pipe", "sid1",
+                    self.log_dir, SpawnSettings(),
+                    on_ready=self._on_ready, on_exit=self._on_exit,
+                    logger=logger, hw_ref="ref")
+                self.assertTrue(self.ready.wait(timeout=3), "on_ready not called")
+        self.assertIsNone(self.got["process"])
+        popen.assert_not_called()
+        self.assertTrue(any("could not resolve hardware-transcode URL" in msg
+                             for msg in logger.errors))
 
 
 if __name__ == "__main__":
