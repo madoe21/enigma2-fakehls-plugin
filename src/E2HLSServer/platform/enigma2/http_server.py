@@ -132,6 +132,14 @@ const RECOVERY_RESET_AFTER_MS = 20000;
 let recoveryAttempts = 0;
 let recoveryResetTimer = null;
 let currentHlsUrl = null;
+// A failing load can keep firing 'error' events while its own player.load()
+// promise is still pending (e.g. once per rejected segment append). Without
+// this guard, attemptRecovery() would call player.load() again on top of
+// the still-in-flight one - two concurrent MediaSource/blob-URL lifecycles
+// on the same player, which is what actually produced the cascade of
+// "Uncaught (in promise)" / stale blob 404s, not the underlying error
+// itself. Set around every player.load() call, initial or recovery.
+let loadInFlight = false;
 // Some stuck states (e.g. the player silently never getting past the
 // filler->real-content discontinuity on a brand-new stream) don't fire a
 // Shaka error event at all - buffered just stops growing. That's exactly
@@ -167,6 +175,11 @@ function startWhenBuffered(v) {
 function onQualityChange() { if (cur >= 0) play(cur); }
 
 function attemptRecovery(label) {
+  // A load already in flight (initial or a previous recovery) is still
+  // producing the errors triggering this call - piling another load() on
+  // top corrupts both. Let the in-flight one finish (its own .catch below
+  // will retry if it ultimately fails).
+  if (loadInFlight) return;
   if (recoveryAttempts >= MAX_ERROR_RECOVERIES) {
     document.getElementById('loading').classList.remove('show');
     showMsg(label + ' (Wiederherstellung fehlgeschlagen)');
@@ -182,7 +195,12 @@ function attemptRecovery(label) {
   // recoverMediaError() - a fresh load() is the documented recovery for a
   // critical error, same effect as switching channel away and back by hand.
   if (player && currentHlsUrl) {
-    player.load(currentHlsUrl).then(() => armPlaybackWatchers(document.getElementById('v'))).catch((e) => {
+    loadInFlight = true;
+    player.load(currentHlsUrl).then(() => {
+      loadInFlight = false;
+      armPlaybackWatchers(document.getElementById('v'));
+    }).catch((e) => {
+      loadInFlight = false;
       document.getElementById('loading').classList.remove('show');
       showMsg('Wiederherstellung fehlgeschlagen: ' + (e.message || e));
     });
@@ -352,6 +370,7 @@ async function play(i) {
   document.getElementById('video-area').classList.add('playing');
   v.style.display = 'block';
   if (player) { try { await player.destroy(); } catch(e) {} player = null; }
+  loadInFlight = false;
   v.pause(); v.removeAttribute('src'); v.load();
   try {
     const quality = document.getElementById('quality-select').value;
@@ -386,7 +405,12 @@ async function play(i) {
         },
       });
       player.addEventListener('error', (event) => onPlayerError(event.detail));
-      await player.load(currentHlsUrl);
+      loadInFlight = true;
+      try {
+        await player.load(currentHlsUrl);
+      } finally {
+        loadInFlight = false;
+      }
       armPlaybackWatchers(v);
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
       v.src = currentHlsUrl;

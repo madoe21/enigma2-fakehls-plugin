@@ -123,6 +123,26 @@ class SegmenterTest(unittest.TestCase):
         self.assertNotIn("abcd1234_seg00000.ts", content)
         self.assertIn("abcd1234_seg00001.ts", content)
 
+    def test_discontinuity_tag_at_mid_stream_pcr_jump(self):
+        # A PCR discontinuity (e.g. ffmpeg's -reconnect firing mid-stream on
+        # a flaky source) can happen anywhere in otherwise-real content, not
+        # just at the filler boundary - the playlist must warn players there
+        # too, or MSE rejects the append with nothing to explain why.
+        self._write_segments(1)
+        self.segmenter._write_segment(bytes(16 * 1024), 2.0, is_discontinuity=True)
+        content = self._playlist_content()
+        self.assertIn("#EXT-X-DISCONTINUITY", content)
+        first_pos = content.index("abcd1234_seg00000.ts")
+        disc_pos = content.index("#EXT-X-DISCONTINUITY")
+        second_pos = content.index("abcd1234_seg00001.ts")
+        self.assertTrue(first_pos < disc_pos < second_pos)
+
+    def test_no_discontinuity_tag_before_first_listed_segment(self):
+        # Not meaningful for a client just joining - nothing precedes it.
+        self.segmenter._write_segment(bytes(16 * 1024), 2.0, is_discontinuity=True)
+        content = self._playlist_content()
+        self.assertNotIn("#EXT-X-DISCONTINUITY", content)
+
     def test_playlist_shows_filler_while_waiting_for_real_content(self):
         self.segmenter._filler_bytes = bytes(16 * 1024)
         self.segmenter.write_initial_segment()

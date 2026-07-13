@@ -75,7 +75,7 @@ class SegmentCutter(object):
             duration = self._seg_duration
         data = bytes(self._buffer)
         self._buffer = bytearray()
-        return [(data, duration)]
+        return [(data, duration, False)]
 
     def _aligned_end(self):
         return len(self._buffer) - (len(self._buffer) % TS_PACKET_SIZE)
@@ -133,12 +133,13 @@ class SegmentCutter(object):
             return []
         if cut is not None:
             cut_pcr = read_pcr_base(self._buffer[cut:cut + TS_PACKET_SIZE])
-            duration = self._segment_duration_from_pcr(self._previous_cut_pcr, cut_pcr, elapsed)
+            duration, is_discontinuity = self._segment_duration_from_pcr(
+                self._previous_cut_pcr, cut_pcr, elapsed)
             segment = self._extract_segment(cut)
             self._scan_pos = TS_PACKET_SIZE
             self._previous_cut_pcr = cut_pcr
             self._segment_start = now
-            return [(segment, duration)]
+            return [(segment, duration, is_discontinuity)]
 
         if elapsed >= self._seg_duration * self.KEYFRAME_WAIT_FACTOR:
             # Stream carries no random-access marks (or a huge GOP): fall
@@ -150,19 +151,25 @@ class SegmentCutter(object):
                 self._scan_pos = 0
                 self._previous_cut_pcr = None
                 self._segment_start = now
-                return [(segment, elapsed)]
+                return [(segment, elapsed, False)]
         return []
 
     def _segment_duration_from_pcr(self, previous_pcr, cut_pcr, wall_elapsed):
-        """Media-time duration between two cuts; wall clock when PCR is unusable."""
+        """Media-time duration between two cuts, and whether a PCR
+        discontinuity was detected; wall clock when PCR is unusable."""
         if previous_pcr is None or cut_pcr is None:
-            return wall_elapsed
+            return wall_elapsed, False
         duration = pcr_delta_seconds(previous_pcr, cut_pcr)
-        # A PCR discontinuity (channel switch upstream, encoder restart) can
-        # yield an absurd span; the wall clock is the safer estimate then.
+        # A PCR discontinuity (channel switch upstream, encoder restart, or
+        # on this receiver ffmpeg's -reconnect firing mid-stream on a flaky
+        # source) can yield an absurd span; the wall clock is the safer
+        # estimate then. The segment starting right after it spliced two
+        # unrelated timelines together with nothing to say so - flag it so
+        # the playlist can warn players (native decoders resync silently;
+        # MSE players reject the append outright without the warning).
         if not 0.2 <= duration <= self._seg_duration * 4:
-            return wall_elapsed
-        return duration
+            return wall_elapsed, True
+        return duration, False
 
 
 # Per-life FIFO suffix: stream_id is a deterministic hash, so a reaped and
@@ -368,8 +375,8 @@ class Segmenter(threading.Thread):
                     time.sleep(0.1)
                     continue
                 got_data = True
-                for data, duration in cutter.feed(chunk):
-                    self._write_segment(data, duration)
+                for data, duration, is_discontinuity in cutter.feed(chunk):
+                    self._write_segment(data, duration, is_discontinuity=is_discontinuity)
         finally:
             try:
                 os.close(pipe_fd)
@@ -377,8 +384,8 @@ class Segmenter(threading.Thread):
                 pass
 
             if not self.stopped():
-                for data, duration in cutter.flush():
-                    self._write_segment(data, duration)
+                for data, duration, is_discontinuity in cutter.flush():
+                    self._write_segment(data, duration, is_discontinuity=is_discontinuity)
 
     def _maybe_emit_filler(self, got_data, force=False):
         """Write another filler segment if real data hasn't started yet and
@@ -392,7 +399,7 @@ class Segmenter(threading.Thread):
         self._write_segment(self._filler_bytes, _FILLER_DURATION, is_filler=True)
         self._last_filler_at = now
 
-    def _write_segment(self, data, duration, is_filler=False):
+    def _write_segment(self, data, duration, is_filler=False, is_discontinuity=False):
         if len(data) < 8 * 1024:
             return
 
@@ -403,7 +410,8 @@ class Segmenter(threading.Thread):
             with open(seg_path, "wb") as handle:
                 handle.write(data)
 
-            self.segments.append((self.segment_index, seg_path, created_at, duration, is_filler))
+            self.segments.append(
+                (self.segment_index, seg_path, created_at, duration, is_filler, is_discontinuity))
             self.segment_index += 1
             self._update_playlist()
             # Once per segment is enough; running this per 64 KB chunk was
@@ -444,7 +452,17 @@ class Segmenter(threading.Thread):
             content += "#EXT-X-TARGETDURATION:" + str(self._target_duration) + "\n"
             content += "#EXT-X-MEDIA-SEQUENCE:" + str(first_seq) + "\n"
 
-            for idx, _seg_path, _created_at, duration, _is_filler in active:
+            # A PCR discontinuity (e.g. ffmpeg's -reconnect firing mid-stream
+            # on a flaky source) splices two unrelated decode timelines
+            # together inside what otherwise looks like ordinary real
+            # content - unlike the filler boundary this can happen anywhere,
+            # repeatedly, throughout playback. Native decoders resync past
+            # it silently; MSE players (Shaka et al.) reject the append
+            # without the tag. Not meaningful on the very first listed
+            # segment - nothing precedes it for a joining client.
+            for i, (idx, _seg_path, _created_at, duration, _is_filler, is_discontinuity) in enumerate(active):
+                if is_discontinuity and i > 0:
+                    content += "#EXT-X-DISCONTINUITY\n"
                 content += "#EXTINF:%.3f,\n" % duration
                 content += self.segment_uri(idx) + "\n"
 
@@ -463,7 +481,7 @@ class Segmenter(threading.Thread):
         # playlist size to cover the window safely (cheap on tmpfs).
         keep = 2 * self.settings.playlist_size()
         if len(self.segments) > keep:
-            for _idx, seg_path, _created_at, _duration, _is_filler in self.segments[:-keep]:
+            for _idx, seg_path, _created_at, _duration, _is_filler, _is_discontinuity in self.segments[:-keep]:
                 try:
                     if os.path.exists(seg_path):
                         os.unlink(seg_path)
@@ -472,7 +490,7 @@ class Segmenter(threading.Thread):
             self.segments = self.segments[-keep:]
 
     def cleanup_all(self):
-        for _idx, seg_path, _created_at, _duration, _is_filler in self.segments:
+        for _idx, seg_path, _created_at, _duration, _is_filler, _is_discontinuity in self.segments:
             try:
                 if os.path.exists(seg_path):
                     os.unlink(seg_path)
