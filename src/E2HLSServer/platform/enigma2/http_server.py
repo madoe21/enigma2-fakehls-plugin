@@ -603,6 +603,11 @@ class HlsRoot(Resource):
         port-8001 stream source ffmpeg reads from. Sleeping stalls that
         source, so the playlist we are waiting for can never appear.
         """
+        # CORS: lets a page served from anywhere else (a standalone test
+        # page, a future browser-based TV client not hosted on this box)
+        # load the manifest this redirects to - the /hls/* responses it
+        # points at need the same header, see render_hls.
+        request.setHeader(b"Access-Control-Allow-Origin", b"*")
         playlist = os.path.join(self.settings.hls_dir(), "live_" + stream_id + ".m3u8")
         redirect_path = ("/hls/live_" + stream_id + ".m3u8").encode()
 
@@ -680,6 +685,11 @@ class HlsRoot(Resource):
         path = request.path.decode()
         filename = path.split("/")[-1]
         filepath = os.path.join(self.settings.hls_dir(), filename)
+
+        # CORS: a page hosted anywhere else (test tools, a future browser
+        # TV client not served from this box) needs this on both the
+        # manifest and every segment fetch to play the stream at all.
+        request.setHeader(b"Access-Control-Allow-Origin", b"*")
 
         # Every fetch counts as activity — playlist AND segments. Some players
         # (VLC caches aggressively) fetch segments without re-reading the
