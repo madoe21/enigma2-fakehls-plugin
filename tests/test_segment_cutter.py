@@ -49,7 +49,7 @@ class SegmentCutterSyncTest(unittest.TestCase):
         self.assertEqual(self.cutter.feed(filler(3) + keyframe + filler()), [])
         segments = self._first_segment_after(video_keyframe(pcr=225000))
         self.assertEqual(len(segments), 1)
-        data, _duration = segments[0]
+        data, _duration, _is_discontinuity = segments[0]
         self.assertEqual(data[:PKT], keyframe)
 
     def test_audio_rai_packets_do_not_sync(self):
@@ -102,10 +102,11 @@ class SegmentCutterCutTest(unittest.TestCase):
         cut_keyframe = video_keyframe(pcr=225000)
         segments = self.cutter.feed(filler() + cut_keyframe + filler())
         self.assertEqual(len(segments), 1)
-        data, duration = segments[0]
+        data, duration, is_discontinuity = segments[0]
         self.assertEqual(data[:PKT], self.first_keyframe)
         self.assertIn(early_keyframe, data)  # retained, not cut at
         self.assertAlmostEqual(duration, 2.5)  # PCR media time, not wall time
+        self.assertFalse(is_discontinuity)
 
     def test_next_segment_starts_at_cut_keyframe(self):
         self.clock.advance(2.1)
@@ -125,9 +126,13 @@ class SegmentCutterCutTest(unittest.TestCase):
 
     def test_duration_falls_back_on_pcr_discontinuity(self):
         self.clock.advance(2.5)
-        # 100 s PCR jump on a 2 s target -> wall clock wins
+        # 100 s PCR jump on a 2 s target -> wall clock wins, and the segment
+        # starting right after the jump must be flagged: it splices two
+        # unrelated timelines together (e.g. ffmpeg's -reconnect firing
+        # mid-stream on a flaky source) with nothing else to say so.
         segments = self.cutter.feed(video_keyframe(pcr=9000000))
         self.assertAlmostEqual(segments[0][1], 2.5)
+        self.assertTrue(segments[0][2])
 
     def test_forced_cut_after_wait_factor_without_keyframes(self):
         self.clock.advance(SEG_DURATION * self.cutter.KEYFRAME_WAIT_FACTOR + 0.1)
@@ -141,9 +146,10 @@ class SegmentCutterCutTest(unittest.TestCase):
         self.cutter.feed(filler())
         segments = self.cutter.flush()
         self.assertEqual(len(segments), 1)
-        data, duration = segments[0]
+        data, duration, is_discontinuity = segments[0]
         self.assertEqual(data[:PKT], self.first_keyframe)
         self.assertAlmostEqual(duration, 1.3)
+        self.assertFalse(is_discontinuity)
         self.assertEqual(self.cutter.flush(), [])  # buffer is gone now
 
     def test_flush_on_empty_buffer(self):
