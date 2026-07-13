@@ -117,7 +117,9 @@ $(IPK_STAGE): $(PY_FILES) $(JSON_FILES) $(HTML_FILES) $(LOCALE_FILES)
 	@if ls $(SRC_DIR)/*.json > /dev/null 2>&1; then \
 		cp $(SRC_DIR)/*.json $(PLUGIN_STAGE)/; \
 	fi
-	@cp $(SRC_DIR)/*.html $(PLUGIN_STAGE)/
+	@if ls $(SRC_DIR)/*.html > /dev/null 2>&1; then \
+		cp $(SRC_DIR)/*.html $(PLUGIN_STAGE)/; \
+	fi
 
 	# Locale files (kept inside src/E2HLSServer like other plugins)
 	@if [ -d $(PLUGIN_LOCALE_DIR) ]; then \
@@ -191,7 +193,9 @@ deploy:
 	@if ls $(SRC_DIR)/*.json > /dev/null 2>&1; then \
 		$(BOX_SCP) $(SRC_DIR)/*.json $(BOX_USER)@$(BOX_HOST):$(BOX_PLUGIN_DIR)/; \
 	fi
-	@$(BOX_SCP) $(SRC_DIR)/*.html $(BOX_USER)@$(BOX_HOST):$(BOX_PLUGIN_DIR)/
+	@if ls $(SRC_DIR)/*.html > /dev/null 2>&1; then \
+		$(BOX_SCP) $(SRC_DIR)/*.html $(BOX_USER)@$(BOX_HOST):$(BOX_PLUGIN_DIR)/; \
+	fi
 
 	@if [ -d $(SRC_DIR)/E2HLSServer/res ]; then \
 		$(BOX_SCP) -r $(SRC_DIR)/E2HLSServer/res $(BOX_USER)@$(BOX_HOST):$(BOX_PLUGIN_DIR)/E2HLSServer/; \
