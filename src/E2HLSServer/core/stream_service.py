@@ -9,7 +9,7 @@ import stat
 import threading
 import time
 
-from .ffmpeg_service import async_start_ffmpeg, build_stream_url, mask_credentials
+from .ffmpeg_service import async_start_ffmpeg, build_stream_url, mask_credentials, uses_stream_relay
 from .mpegts import (
     TS_PACKET_SIZE,
     find_keyframe_cut,
@@ -612,7 +612,14 @@ class StreamService(object):
         segmenter.write_initial_segment()
 
         stream_url = build_stream_url(effective_params, self.settings)
-        self.logger.info("Stream " + stream_id + " input: " + mask_credentials(stream_url))
+        # The relay wins over hardware transcode too (see build_stream_url) -
+        # only resolve a real transcode session when the relay didn't
+        # already claim this ref.
+        hw_ref = params["ref"] if (hw and not uses_stream_relay(params["ref"], self.settings)) else None
+        if hw_ref is not None:
+            self.logger.info("Stream " + stream_id + " input: hardware-transcode (resolving via OpenWebif)")
+        else:
+            self.logger.info("Stream " + stream_id + " input: " + mask_credentials(stream_url))
 
         info = {
             "id": stream_id,
@@ -642,6 +649,7 @@ class StreamService(object):
             e2_user=effective_params.get("e2_user"),
             e2_pass=effective_params.get("e2_pass"),
             logger=self.logger,
+            hw_ref=hw_ref,
         )
 
         # The segmenter runs in its own thread and consumes the pipe until
