@@ -25,11 +25,8 @@ port:
 # Direct HLS, OpenWebInterface style (Roku, VLC): service ref straight in the path
 http://<box-ip>:8003/<service-ref>
 
-# Web player (browser)
-http://<box-ip>:8003/player?ref=<service-ref>&user=<user>&pass=<pass>
-
-# Legacy query form (still supported)
-http://<box-ip>:8003/stream?ref=<service-ref>&user=<user>&pass=<pass>
+# Web player (browser) — bouquet/channel picker with now/next EPG
+http://<box-ip>:8003/web
 ```
 
 Example: `http://192.168.1.10:8003/1:0:19:283D:3FB:1:C00000:0:0:0:`
@@ -68,7 +65,6 @@ E2HLSServer/
 │   │       │   ├── http_server.py
 │   │       │   └── ui.py
 │   │       └── kodi/       # Kodi adapter placeholder
-│   └── player_template.html
 ├── test.http
 ├── control/
 │   ├── control
@@ -107,8 +103,7 @@ make clean
 Use the included `test.http` to quickly verify:
 
 - `/status`
-- `/player`
-- `/stream`
+- `/web`
 - `/logs`
 
 ## Box Utilities
