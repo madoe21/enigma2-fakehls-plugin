@@ -414,7 +414,25 @@ class Segmenter(threading.Thread):
 
     def _update_playlist(self):
         try:
-            active = self.segments[-self.settings.playlist_size():]
+            # The filler clip is an independently-encoded standalone file
+            # (different resolution/profile - see assets/README.md) with its
+            # own SPS/PPS and its own PTS/DTS timeline; real segments use
+            # -copyts -start_at_zero, a completely different timeline.
+            # #EXT-X-DISCONTINUITY correctly signals the jump, but MSE still
+            # has to actually renegotiate the SourceBuffer across a
+            # resolution/profile change to append across it, which browsers
+            # handle poorly to begin with - and Shaka's live-edge start
+            # position for a *freshly ready* stream (barely any real content
+            # yet) can easily land exactly there. Once any real segment
+            # exists, stop advertising filler ones at all so a client never
+            # has a reason to cross that boundary; VLC never depended on
+            # them being listed either. Filler files still get cleaned up
+            # normally via segment retention/cleanup_all - only the
+            # playlist's view of them changes here.
+            real_segments = [seg for seg in self.segments if not seg[4]]
+            source = real_segments if real_segments else self.segments
+
+            active = source[-self.settings.playlist_size():]
             first_seq = active[0][0]
             # Players schedule fetches from EXTINF; report measured durations,
             # not the nominal target, or the live edge drifts and stutters.
@@ -426,19 +444,7 @@ class Segmenter(threading.Thread):
             content += "#EXT-X-TARGETDURATION:" + str(self._target_duration) + "\n"
             content += "#EXT-X-MEDIA-SEQUENCE:" + str(first_seq) + "\n"
 
-            # The filler clip is an independently-encoded standalone file with
-            # its own SPS/PPS and its own PTS/DTS timeline; real segments use
-            # -copyts -start_at_zero, a completely different timeline. Playing
-            # one straight into the other without announcing it is a
-            # timestamp discontinuity - MSE (hls.js et al.) reject the
-            # appendBuffer() for that as a decode error; native players
-            # (VLC/libavcodec) just resync and carry on, which is why this
-            # only ever showed up as "the web player" being broken.
-            previous_kind = None
-            for idx, _seg_path, _created_at, duration, is_filler in active:
-                if previous_kind is not None and is_filler != previous_kind:
-                    content += "#EXT-X-DISCONTINUITY\n"
-                previous_kind = is_filler
+            for idx, _seg_path, _created_at, duration, _is_filler in active:
                 content += "#EXTINF:%.3f,\n" % duration
                 content += self.segment_uri(idx) + "\n"
 

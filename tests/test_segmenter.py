@@ -107,17 +107,27 @@ class SegmenterTest(unittest.TestCase):
         is_filler = self.segmenter.segments[0][4]
         self.assertTrue(is_filler, "initial segment must be flagged as filler")
 
-    def test_discontinuity_tag_at_filler_to_real_boundary(self):
+    def test_playlist_drops_filler_once_real_content_exists(self):
+        # Regression: #EXT-X-DISCONTINUITY correctly signals the filler/real
+        # boundary, but the filler is a different resolution/profile - MSE
+        # (Shaka et al.) still has to renegotiate the SourceBuffer across
+        # it, which is exactly what a fresh stream's live-edge start landed
+        # on, breaking playback (VLC never had this problem). Once any real
+        # segment exists, the filler must vanish from the advertised
+        # playlist entirely so a client has no reason to ever cross it.
         self.segmenter._filler_bytes = bytes(16 * 1024)
         self.segmenter.write_initial_segment()
         self._write_segments(1)  # a real segment via the normal path
         content = self._playlist_content()
-        self.assertIn("#EXT-X-DISCONTINUITY", content)
-        # The tag must sit between the filler and the real segment's URI.
-        filler_pos = content.index("abcd1234_seg00000.ts")
-        disc_pos = content.index("#EXT-X-DISCONTINUITY")
-        real_pos = content.index("abcd1234_seg00001.ts")
-        self.assertTrue(filler_pos < disc_pos < real_pos)
+        self.assertNotIn("#EXT-X-DISCONTINUITY", content)
+        self.assertNotIn("abcd1234_seg00000.ts", content)
+        self.assertIn("abcd1234_seg00001.ts", content)
+
+    def test_playlist_shows_filler_while_waiting_for_real_content(self):
+        self.segmenter._filler_bytes = bytes(16 * 1024)
+        self.segmenter.write_initial_segment()
+        content = self._playlist_content()
+        self.assertIn("abcd1234_seg00000.ts", content)
 
     def test_old_segment_files_are_deleted(self):
         self._write_segments(6)
