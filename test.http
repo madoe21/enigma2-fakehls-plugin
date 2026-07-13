@@ -8,30 +8,34 @@
 GET http://{{boxIp}}:{{httpPort}}/status
 Accept: text/plain
 
-### 2) Render player page
-GET http://{{boxIp}}:{{httpPort}}/player?ref={{serviceRef}}&user={{streamUser}}&pass={{streamPass}}
+### 2) Web player page
+GET http://{{boxIp}}:{{httpPort}}/web
 Accept: text/html
 
-### 3) Direct stream redirect to HLS playlist
-GET http://{{boxIp}}:{{httpPort}}/stream?ref={{serviceRef}}&user={{streamUser}}&pass={{streamPass}}
+### 3) OpenWebInterface-style root streaming (redirects to HLS playlist)
+GET http://{{boxIp}}:{{httpPort}}/{{serviceRef}}?user={{streamUser}}&pass={{streamPass}}
 Accept: application/vnd.apple.mpegurl
 
 ### 4) Fetch server logs
 GET http://{{boxIp}}:{{httpPort}}/logs
 Accept: text/plain
 
-### 5) OpenWebInterface-style root streaming (redirects to HLS playlist)
-GET http://{{boxIp}}:{{httpPort}}/{{serviceRef}}
-Accept: application/vnd.apple.mpegurl
-
-### 6) List bouquets (parsed locally from /etc/enigma2)
+### 5) List bouquets (parsed locally from /etc/enigma2)
 GET http://{{boxIp}}:{{httpPort}}/api/bouquets
 Accept: application/json
 
-### 7) List channels of a bouquet (names resolved via lamedb)
+### 6) List channels of a bouquet (names resolved via lamedb)
 GET http://{{boxIp}}:{{httpPort}}/api/channels?ref=userbouquet.favourites.tv
 Accept: application/json
 
-### 8) Missing bouquet returns 404
+### 7) Missing bouquet returns 404
 GET http://{{boxIp}}:{{httpPort}}/api/channels?ref=does-not-exist.tv
+Accept: application/json
+
+### 8) Start a stream, get its id + playlist name (JSON, used by the web player)
+GET http://{{boxIp}}:{{httpPort}}/api/start?ref={{serviceRef}}&quality=balanced
+Accept: application/json
+
+### 9) Stream readiness + now/next EPG (id from #8's response)
+GET http://{{boxIp}}:{{httpPort}}/api/status?id=REPLACE_WITH_ID&ref={{serviceRef}}
 Accept: application/json

@@ -12,7 +12,7 @@ from twisted.web import static
 from twisted.web.resource import Resource
 from twisted.web.server import NOT_DONE_YET, Site
 
-from .config import HTML_TEMPLATE_FILE, get_favicon_path
+from .config import get_favicon_path
 
 try:
     from enigma import eServiceCenter, eServiceReference, eEPGCache
@@ -287,18 +287,36 @@ function filterChannels(q) {
   cur = -1; renderList();
 }
 
+function fmtEpg(ev) {
+  const t = d => d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+  return t(new Date(ev.begin * 1000)) + '–' + t(new Date(ev.end * 1000)) + ' ' + ev.title;
+}
+
+function renderEpg(data) {
+  document.getElementById('epg-now').textContent = data.now ? fmtEpg(data.now) : '';
+  document.getElementById('epg-next').textContent = data.next ? ('Danach: ' + fmtEpg(data.next)) : '';
+}
+
+// Single poll target for both jobs at once: whether the stream has cut real
+// content yet, and now/next EPG for the selected channel - one endpoint
+// instead of two, since the web player always wants both together.
+async function fetchStatus(streamId, ref) {
+  const r = await fetch('/api/status?id=' + encodeURIComponent(streamId) + '&ref=' + encodeURIComponent(ref));
+  return r.json();
+}
+
 // Poll until the stream has cut real content, instead of handing the
 // player a URL that starts with the filler. VLC/native players sit through
 // the filler -> #EXT-X-DISCONTINUITY -> real transition just fine; browser
 // MSE players (Shaka, hls.js, any of them - same underlying browser decode
 // pipeline) are visibly slow re-initialising around that discontinuity,
 // which showed up as a long buffering hang. This path is web-player only.
-async function waitUntilReady(streamId, maxWaitMs) {
+async function waitUntilReady(streamId, ref, maxWaitMs) {
   const t0 = Date.now();
   while (Date.now() - t0 < maxWaitMs) {
     try {
-      const r = await fetch('/api/ready?id=' + encodeURIComponent(streamId));
-      const data = await r.json();
+      const data = await fetchStatus(streamId, ref);
+      renderEpg(data);
       if (data.ready) return true;
     } catch (e) { /* transient - keep polling */ }
     document.getElementById('loading-text').textContent =
@@ -308,30 +326,20 @@ async function waitUntilReady(streamId, maxWaitMs) {
   return false;
 }
 
-function fmtEpg(ev) {
-  const t = d => d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
-  return t(new Date(ev.begin * 1000)) + '–' + t(new Date(ev.end * 1000)) + ' ' + ev.title;
-}
-
-// EPG for the currently selected channel only - no bulk lookups. Re-polled
-// every EPG_REFRESH_MS while a channel stays selected so "jetzt" doesn't go
-// stale once the current programme ends.
-async function updateEpg(ref) {
-  const nowEl = document.getElementById('epg-now');
-  const nextEl = document.getElementById('epg-next');
+// Re-polled every EPG_REFRESH_MS while a channel stays selected so "jetzt"
+// doesn't go stale once the current programme ends.
+async function updateEpg(streamId, ref) {
   try {
-    const r = await fetch('/api/epg?ref=' + encodeURIComponent(ref));
-    const data = await r.json();
-    nowEl.textContent = data.now ? fmtEpg(data.now) : '';
-    nextEl.textContent = data.next ? ('Danach: ' + fmtEpg(data.next)) : '';
+    renderEpg(await fetchStatus(streamId, ref));
   } catch (e) {
-    nowEl.textContent = ''; nextEl.textContent = '';
+    renderEpg({});
   }
 }
 
 async function play(i) {
   cur = i;
   const ch = filtered[i];
+  let streamId = null;
   const v = document.getElementById('v');
   if (bufferTimer) { clearInterval(bufferTimer); bufferTimer = null; }
   if (recoveryResetTimer) { clearTimeout(recoveryResetTimer); recoveryResetTimer = null; }
@@ -353,9 +361,10 @@ async function play(i) {
     const startRes = await fetch('/api/start?ref=' + encodeURIComponent(ch.ref) + '&quality=' + encodeURIComponent(quality));
     const startData = await startRes.json();
     if (!startData.id) throw new Error(startData.error || 'Stream konnte nicht gestartet werden');
+    streamId = startData.id;
     currentHlsUrl = '/hls/' + startData.playlist;
 
-    const gotReal = await waitUntilReady(startData.id, 45000);
+    const gotReal = await waitUntilReady(streamId, ch.ref, 45000);
     if (!gotReal) {
       // Gave up waiting - load anyway (filler and all); better than an
       // infinite spinner, same as the pre-filler fallback behaviour.
@@ -392,8 +401,10 @@ async function play(i) {
   document.getElementById('now').style.display = 'block';
   document.getElementById('now-title').textContent = ch.name;
   document.title = ch.name + ' — E2HLS';
-  updateEpg(ch.ref);
-  epgRefreshTimer = setInterval(() => updateEpg(ch.ref), EPG_REFRESH_MS);
+  if (streamId) {
+    updateEpg(streamId, ch.ref);
+    epgRefreshTimer = setInterval(() => updateEpg(streamId, ch.ref), EPG_REFRESH_MS);
+  }
   renderList();
   document.querySelectorAll('.ch')[i]?.scrollIntoView({block:'nearest'});
 }
@@ -461,26 +472,13 @@ window.addEventListener('load', () => {
 </html>"""
 
 
-def load_html_template():
-    try:
-        if os.path.exists(HTML_TEMPLATE_FILE):
-            with open(HTML_TEMPLATE_FILE, "r", encoding="utf-8") as handle:
-                return handle.read()
-        print("[E2HLSServer] ERROR: HTML template not found: " + HTML_TEMPLATE_FILE)
-        return None
-    except Exception as exc:
-        print("[E2HLSServer] Error loading HTML template: " + str(exc))
-        return None
-
-
 class HlsRoot(Resource):
-    def __init__(self, stream_service, logger, settings, local_ip_provider, html_template):
+    def __init__(self, stream_service, logger, settings, local_ip_provider):
         Resource.__init__(self)
         self.stream_service = stream_service
         self.logger = logger
         self.settings = settings
         self.local_ip_provider = local_ip_provider
-        self.html_template = html_template
         # Bouquet parsing triggers O(N) lamedb lookups per request on the
         # shared reactor; cache per file mtime. Name lookups are cached for
         # the process lifetime — lamedb only changes on a service scan,
@@ -500,30 +498,22 @@ class HlsRoot(Resource):
 
         if path == "/" or path == "/web" or path == "/web/":
             return self.render_web(request)
-        if path == "/player":
-            return self.render_player(request)
         if path == "/favicon.ico" or path == "/res/favicon.png":
             return self.render_favicon(request)
-        if path == "/stream":
-            return self.render_stream(request)
         if path.startswith("/hls/"):
             return self.render_hls(request)
         if path == "/status":
             return self.render_status(request)
         if path == "/logs":
             return self.render_logs(request)
-        if path == "/debug/bouquets":
-            return self.render_debug_bouquets(request)
         if path == "/api/bouquets":
             return self.render_api_bouquets(request)
         if path == "/api/channels":
             return self.render_api_channels(request)
         if path == "/api/start":
             return self.render_api_start(request)
-        if path == "/api/ready":
-            return self.render_api_ready(request)
-        if path == "/api/epg":
-            return self.render_api_epg(request)
+        if path == "/api/status":
+            return self.render_api_status(request)
 
         # OpenWebInterface-style streaming: http://<box-ip>:<port>/<service-ref>
         # (same URL shape as the STB streaming port, just HLS on this port).
@@ -550,64 +540,6 @@ class HlsRoot(Resource):
             self.logger.warning("Invalid Authorization header received")
             return None, None
 
-    def _parse_params(self, request):
-        args = request.args
-        ref = args.get(b"ref", [None])[0]
-        user = args.get(b"user", [None])[0]
-        password = args.get(b"pass", [None])[0]
-
-        if ref is None:
-            return None
-
-        query_user = urllib.parse.unquote(user.decode()) if user else None
-        query_pass = urllib.parse.unquote(password.decode()) if password else None
-        header_user, header_pass = self._parse_basic_auth(request)
-
-        return {
-            "ref": urllib.parse.unquote(ref.decode()),
-            "user": query_user if query_user is not None else header_user,
-            "password": query_pass if query_pass is not None else header_pass,
-        }
-
-    def _build_external_url(self, params, path):
-        ip_addr = self.local_ip_provider()
-        port = self.settings.http_port()
-        parts = ["ref=" + urllib.parse.quote(params["ref"])]
-        if params.get("user"):
-            parts.append("user=" + urllib.parse.quote(params["user"]))
-        if params.get("password"):
-            parts.append("pass=" + urllib.parse.quote(params["password"]))
-        return "http://" + ip_addr + ":" + str(port) + path + "?" + "&".join(parts)
-
-    def render_player(self, request):
-        if self.html_template is None:
-            return b"ERROR: HTML template not loaded"
-
-        params = self._parse_params(request)
-        if params is None:
-            return b"Missing ref parameter"
-
-        stream_id, _is_new = self.stream_service.get_or_create_stream(params)
-        if stream_id is None:
-            return b"Failed to start stream"
-
-        ip_addr = self.local_ip_provider()
-        port = self.settings.http_port()
-        hls_url = "http://" + ip_addr + ":" + str(port) + "/hls/live_" + stream_id + ".m3u8"
-        ext_url = self._build_external_url(params, "/stream")
-
-        try:
-            html = self.html_template
-            html = html.replace("{stream_id}", stream_id)
-            html = html.replace("{service_ref}", params["ref"])
-            html = html.replace("{external_url}", ext_url)
-            html = html.replace("{hls_url}", hls_url)
-            self.logger.log_request("GET", "/player", request.getClientIP(), 200, len(html))
-            return html.encode()
-        except Exception as exc:
-            self.logger.error("HTML template error: " + str(exc))
-            return ("Error generating player page: " + str(exc)).encode()
-
     def render_favicon(self, request):
         favicon_path = get_favicon_path()
         if not os.path.exists(favicon_path):
@@ -625,19 +557,6 @@ class HlsRoot(Resource):
             self.logger.error("Error reading favicon: " + str(exc))
             request.setResponseCode(500)
             return b""
-
-    def render_stream(self, request):
-        params = self._parse_params(request)
-        if params is None:
-            request.setResponseCode(400)
-            return b"Missing ref parameter"
-
-        stream_id, _is_new = self.stream_service.get_or_create_stream(params)
-        if stream_id is None:
-            request.setResponseCode(500)
-            return b"Failed to start stream"
-
-        return self._redirect_when_playlist_ready(request, stream_id)
 
     def _redirect_when_playlist_ready(self, request, stream_id):
         """Redirect to the stream's playlist, which normally already exists.
@@ -833,48 +752,6 @@ class HlsRoot(Resource):
         except Exception as exc:
             return ("Error reading logs: " + str(exc)).encode()
 
-    def render_debug_bouquets(self, request):
-        bouquet_dir = BOUQUET_DIR
-        lines = ["=== Bouquet Debug ===\n"]
-        try:
-            files = sorted(os.listdir(bouquet_dir))
-            lines.append("Files in %s:\n" % bouquet_dir)
-            for f in files:
-                if "bouquet" in f.lower():
-                    lines.append("  " + f + "\n")
-            lines.append("\n")
-        except Exception as exc:
-            lines.append("Cannot list dir: " + str(exc) + "\n\n")
-
-        top = os.path.join(bouquet_dir, "bouquets.tv")
-        if os.path.exists(top):
-            lines.append("=== bouquets.tv content ===\n")
-            try:
-                with open(top, "r", encoding="utf-8", errors="ignore") as handle:
-                    lines.append(handle.read())
-            except Exception as exc:
-                lines.append("Read error: " + str(exc))
-        else:
-            lines.append("bouquets.tv NOT FOUND\n")
-
-        lines.append("\n\n=== Parsed result ===\n")
-        sub_bouquets = self._parse_top_bouquet_file(top) if os.path.exists(top) else []
-        if not sub_bouquets:
-            lines.append("_parse_top_bouquet_file returned EMPTY LIST\n")
-        for name, filename in sub_bouquets:
-            sub_path = os.path.join(bouquet_dir, filename)
-            exists = os.path.exists(sub_path)
-            try:
-                channels = self._parse_channel_file(sub_path) if exists else []
-            except Exception as exc:
-                channels = []
-                lines.append("Error parsing %s: %s\n" % (filename, exc))
-            lines.append("  [%s] %s -> %d channels (file %s)\n" % (
-                "OK" if exists else "MISSING", name, len(channels), filename))
-
-        request.setHeader(b"Content-Type", b"text/plain; charset=utf-8")
-        return "".join(lines).encode("utf-8")
-
     def _json_response(self, request, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         request.setResponseCode(status)
@@ -940,19 +817,6 @@ class HlsRoot(Resource):
             "playlist": "live_" + stream_id + ".m3u8",
         })
 
-    def render_api_ready(self, request):
-        """True once the given stream has cut at least one real (non-filler)
-        segment - see StreamService.has_real_data."""
-        stream_id_raw = request.args.get(b"id", [None])[0]
-        if not stream_id_raw:
-            request.setResponseCode(400)
-            return self._json_response(request, {"error": "Missing id"}, 400)
-        stream_id = stream_id_raw.decode()
-        self.stream_service.update_access(stream_id)
-        return self._json_response(request, {
-            "ready": self.stream_service.has_real_data(stream_id),
-        })
-
     def _epg_event_dict(self, event):
         if event is None:
             return None
@@ -964,15 +828,11 @@ class HlsRoot(Resource):
             "end": begin + duration,
         }
 
-    def render_api_epg(self, request):
-        """Now/next EPG info for a single service ref (the currently
-        selected channel only — not a bulk lookup)."""
-        ref_raw = request.args.get(b"ref", [None])[0]
-        if not ref_raw:
-            return self._json_response(request, {"error": "Missing ref"}, 400)
-        ref = urllib.parse.unquote(ref_raw.decode())
-        if eEPGCache is None or eServiceReference is None:
-            return self._json_response(request, {"now": None, "next": None})
+    def _lookup_epg(self, ref):
+        """Now/next EPG info for a single service ref, or (None, None) if
+        unavailable - never raises."""
+        if eEPGCache is None or eServiceReference is None or not ref:
+            return None, None
         try:
             service = eServiceReference(ref)
             epgcache = eEPGCache.getInstance()
@@ -982,44 +842,38 @@ class HlsRoot(Resource):
                     service, now_event.getBeginTime() + now_event.getDuration(), +1)
             else:
                 next_event = epgcache.lookupEventTime(service, -1, +1)
-            return self._json_response(request, {
-                "now": self._epg_event_dict(now_event),
-                "next": self._epg_event_dict(next_event),
-            })
+            return now_event, next_event
         except Exception as exc:
             self.logger.debug("EPG lookup failed for %s: %s" % (ref, exc))
-            return self._json_response(request, {"now": None, "next": None})
+            return None, None
+
+    def render_api_status(self, request):
+        """Combined poll target for the web player: whether the stream has
+        cut real (non-filler) content yet (see StreamService.has_real_data)
+        plus now/next EPG for the currently selected channel - one endpoint
+        instead of two, since the client always wants both together (fast
+        polling while starting, then a slow refresh while watching)."""
+        stream_id_raw = request.args.get(b"id", [None])[0]
+        if not stream_id_raw:
+            request.setResponseCode(400)
+            return self._json_response(request, {"error": "Missing id"}, 400)
+        stream_id = stream_id_raw.decode()
+        self.stream_service.update_access(stream_id)
+
+        ref_raw = request.args.get(b"ref", [None])[0]
+        ref = urllib.parse.unquote(ref_raw.decode()) if ref_raw else None
+        now_event, next_event = self._lookup_epg(ref)
+
+        return self._json_response(request, {
+            "ready": self.stream_service.has_real_data(stream_id),
+            "now": self._epg_event_dict(now_event),
+            "next": self._epg_event_dict(next_event),
+        })
 
     def render_web(self, request):
         request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
         self.logger.log_request("GET", "/web", request.getClientIP(), 200)
         return _WEB_HTML.encode("utf-8")
-
-    def _load_bouquets(self):
-        bouquets = []
-        errors = []
-        bouquet_dir = BOUQUET_DIR
-        top_file = os.path.join(bouquet_dir, "bouquets.tv")
-
-        try:
-            if not os.path.exists(top_file):
-                errors.append("bouquets.tv nicht gefunden in " + bouquet_dir)
-                return bouquets, errors
-
-            sub_bouquets = self._parse_top_bouquet_file(top_file)
-
-            for name, filename in sub_bouquets:
-                sub_path = os.path.join(bouquet_dir, filename)
-                try:
-                    channels = self._parse_channel_file(sub_path)
-                    if channels:
-                        bouquets.append({"name": name, "services": channels, "file": filename})
-                except Exception as exc:
-                    errors.append("Fehler beim Lesen von %s: %s" % (filename, exc))
-        except Exception as exc:
-            errors.append("Fehler beim Laden der Bouquets: " + str(exc))
-
-        return bouquets, errors
 
     def _parse_top_bouquet_file(self, path):
         # collect (ref, description_or_None) pairs
@@ -1132,149 +986,6 @@ class HlsRoot(Resource):
             self._name_cache[ref] = ""
             return ""
 
-    def _build_web_html(self, bouquets, errors):
-        html_parts = ["""<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>E2HLS &mdash; TV Bouquets</title>
-<link rel="icon" type="image/png" href="/res/favicon.png">
-<style>
-:root{--bg:#0d0d12;--surface:#16161e;--surface2:#1e1e28;--border:#28283a;--text:#ddddf0;--dim:#7070a0;--accent:#6c8fff;--accent-h:#9ab0ff;--green:#4ade80}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:15px;line-height:1.5;min-height:100vh}
-a{color:inherit;text-decoration:none}
-
-/* header */
-.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:50}
-.hdr img{width:28px;height:28px;border-radius:6px}
-.hdr-title{font-size:17px;font-weight:700;letter-spacing:-.2px}
-.hdr-sub{margin-left:auto;font-size:12px;color:var(--dim);background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:3px 12px}
-
-/* main */
-main{max-width:860px;margin:0 auto;padding:24px 16px 48px}
-
-/* search */
-.search{position:relative;margin-bottom:20px}
-.search input{width:100%;padding:11px 16px 11px 42px;background:var(--surface);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:15px;outline:none;transition:border-color .15s}
-.search input::placeholder{color:var(--dim)}
-.search input:focus{border-color:var(--accent)}
-.search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:16px;pointer-events:none}
-
-/* bouquet card */
-.bq{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:10px;overflow:hidden;transition:border-color .15s}
-.bq.open{border-color:#3a3a5a}
-.bq-hdr{display:flex;align-items:center;padding:14px 18px;cursor:pointer;gap:12px;user-select:none;transition:background .12s}
-.bq-hdr:hover{background:var(--surface2)}
-.bq-arrow{color:var(--dim);font-size:11px;transition:transform .2s;flex-shrink:0}
-.bq.open .bq-arrow{transform:rotate(90deg)}
-.bq-name{font-weight:600;font-size:15px;flex:1}
-.bq-badge{background:var(--surface2);color:var(--dim);border:1px solid var(--border);border-radius:20px;padding:2px 10px;font-size:12px;font-variant-numeric:tabular-nums}
-
-/* channel list */
-.ch-list{display:none;border-top:1px solid var(--border)}
-.bq.open .ch-list{display:block}
-.ch{display:flex;align-items:center;padding:10px 18px 10px 46px;gap:10px;border-bottom:1px solid var(--border);transition:background .1s}
-.ch:last-child{border-bottom:none}
-.ch:hover{background:var(--surface2)}
-.ch-dot{width:6px;height:6px;border-radius:50%;background:var(--border);flex-shrink:0;transition:background .1s}
-.ch:hover .ch-dot{background:var(--accent)}
-.ch-name{flex:1;color:var(--text);transition:color .1s}
-.ch:hover .ch-name{color:var(--accent-h)}
-.ch-play{color:var(--accent);font-size:12px;opacity:0;transition:opacity .1s}
-.ch:hover .ch-play{opacity:1}
-
-/* empty / error */
-.ch-empty{padding:12px 18px 12px 46px;color:var(--dim);font-size:13px}
-.err-box{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);color:#f87171;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px}
-.no-data{text-align:center;padding:60px 20px;color:var(--dim)}
-.no-data svg{opacity:.3;margin-bottom:12px}
-
-/* footer */
-footer{text-align:center;color:var(--dim);font-size:12px;padding:20px;border-top:1px solid var(--border);margin-top:40px}
-</style>
-</head>
-<body>
-<header class="hdr">
-  <img src="/res/favicon.png" alt="E2HLS">
-  <span class="hdr-title">E2HLS Server</span>
-  <span class="hdr-sub">TV Bouquets</span>
-</header>
-<main>"""]
-
-        if errors:
-            err_lines = "<br>".join(e.replace("<", "&lt;") for e in errors)
-            html_parts.append('<div class="err-box"><strong>Fehler:</strong><br>%s</div>' % err_lines)
-
-        # search box
-        html_parts.append("""<div class="search">
-  <span class="search-icon">&#128269;</span>
-  <input type="search" id="q" placeholder="Sender suchen&hellip;" autocomplete="off" spellcheck="false">
-</div>
-<div id="list">""")
-
-        if not bouquets:
-            html_parts.append("""<div class="no-data">
-  <div style="font-size:48px;opacity:.2">&#128250;</div>
-  <div>Keine TV-Bouquets gefunden.</div>
-  <div style="font-size:13px;margin-top:6px">Prüfe ob <code>/etc/enigma2/bouquets.tv</code> vorhanden ist.</div>
-</div>""")
-        else:
-            for bouquet in bouquets:
-                name = (bouquet["name"] or bouquet["file"]).replace("<", "&lt;").replace(">", "&gt;")
-                count = len(bouquet["services"])
-                html_parts.append(
-                    '<div class="bq">'
-                    '<div class="bq-hdr" onclick="toggle(this)">'
-                    '<span class="bq-arrow">&#9654;</span>'
-                    '<span class="bq-name">%s</span>'
-                    '<span class="bq-badge">%d</span>'
-                    '</div>'
-                    '<div class="ch-list">' % (name, count)
-                )
-                if count == 0:
-                    html_parts.append('<div class="ch-empty">Keine Sender in diesem Bouquet.</div>')
-                else:
-                    for service in bouquet["services"]:
-                        encoded_ref = urllib.parse.quote(service["ref"], safe="")
-                        display = service["name"].replace("<", "&lt;").replace(">", "&gt;")
-                        html_parts.append(
-                            '<a class="ch" href="/player?ref=%s">'
-                            '<span class="ch-dot"></span>'
-                            '<span class="ch-name">%s</span>'
-                            '<span class="ch-play">&#9654;</span>'
-                            '</a>' % (encoded_ref, display)
-                        )
-                html_parts.append('</div></div>')
-
-        html_parts.append("""</div>
-</main>
-<footer>E2HLS Server &bull; Sender anklicken zum Starten des Streams</footer>
-<script>
-function toggle(hdr){hdr.closest('.bq').classList.toggle('open')}
-
-const inp=document.getElementById('q');
-inp.addEventListener('input',function(){
-  const q=this.value.toLowerCase();
-  document.querySelectorAll('.bq').forEach(function(bq){
-    let n=0;
-    bq.querySelectorAll('.ch').forEach(function(ch){
-      const m=!q||ch.querySelector('.ch-name').textContent.toLowerCase().includes(q);
-      ch.style.display=m?'':'none';
-      if(m)n++;
-    });
-    bq.style.display=(n>0||!q)?'':'none';
-    if(q&&n>0)bq.classList.add('open');
-    else if(!q)bq.classList.remove('open');
-  });
-});
-</script>
-</body>
-</html>""")
-
-        return "".join(html_parts)
-
 
 class HlsHttpServer(object):
     def __init__(self, stream_service, logger, settings, local_ip_provider):
@@ -1283,7 +994,6 @@ class HlsHttpServer(object):
         self.settings = settings
         self.local_ip_provider = local_ip_provider
         self._listener = None
-        self._html_template = load_html_template()
 
     def is_running(self):
         return self._listener is not None
@@ -1301,7 +1011,6 @@ class HlsHttpServer(object):
                 logger=self.logger,
                 settings=self.settings,
                 local_ip_provider=self.local_ip_provider,
-                html_template=self._html_template,
             )
             site = Site(root)
             port = self.settings.http_port()

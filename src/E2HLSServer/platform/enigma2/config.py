@@ -50,7 +50,6 @@ PLUGIN_RES_PATH = "Extensions/E2HLSServer/E2HLSServer/res"
 PLUGIN_ICON_FALLBACK = "plugin.png"
 FAVICON_FILENAME = "favicon.png"
 PLUGIN_PATH = "/usr/lib/enigma2/python/Plugins/Extensions/E2HLSServer"
-HTML_TEMPLATE_FILE = os.path.join(PLUGIN_PATH, "player_template.html")
 
 
 def icon_file_for_aspect_ratio():

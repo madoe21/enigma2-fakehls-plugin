@@ -145,8 +145,8 @@ class E2HlsServerMainScreen(Screen):
             status += "\n"
 
         status += "URLs:\n"
-        status += "  Player: http://" + ip_addr + ":" + str(port) + "/player?ref=<ref>\n"
-        status += "  Stream: http://" + ip_addr + ":" + str(port) + "/stream?ref=<ref>\n"
+        status += "  Web:    http://" + ip_addr + ":" + str(port) + "/web\n"
+        status += "  Stream: http://" + ip_addr + ":" + str(port) + "/<ref>\n"
         status += "  Status: http://" + ip_addr + ":" + str(port) + "/status\n"
         status += "  Logs:   http://" + ip_addr + ":" + str(port) + "/logs"
 
