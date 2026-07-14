@@ -16,6 +16,7 @@ from .mpegts import (
     pcr_delta_seconds,
     read_pcr_base,
 )
+from .priority import boost_current_thread_priority
 
 QUALITY_PRESETS = {
     "hw_transcode": {"label": "Hardware-Transcode (Port 8002)", "seg_duration": 2},
@@ -335,6 +336,11 @@ class Segmenter(threading.Thread):
             pass
 
     def run(self):
+        # This thread turns pipe bytes into segment files on the wall
+        # clock; GUI/EPG work contending for CPU on the same box shows up
+        # here as a slow write, which is exactly the segment-timing jitter
+        # that causes decoder-side artifacts on the player end.
+        boost_current_thread_priority()
         while not self.stopped() and not self._writer_exited.is_set():
             try:
                 self._run_segmentation()

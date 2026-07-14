@@ -26,6 +26,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from .priority import boost_current_thread_priority
+
 try:
     import gi
     gi.require_version("Gst", "1.0")
@@ -645,6 +647,10 @@ def async_start_gst(stream_url, output_pipe, stream_id, log_dir, settings,
 
     def _spawn():
         nonlocal stream_url, e2_user, e2_pass
+        # This thread drives the pipeline's GLib.MainLoop (bus messages,
+        # pad negotiation, reconnect timing) - contention here delays
+        # exactly the events that keep the FIFO fed on schedule.
+        boost_current_thread_priority()
         if hw_ref is not None:
             try:
                 stream_url = resolve_hw_stream_url(

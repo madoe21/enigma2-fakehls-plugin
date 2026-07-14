@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import socket
 import urllib.parse
 
 from twisted.internet import defer, reactor, threads
@@ -497,6 +498,42 @@ window.addEventListener('load', () => {
 </html>"""
 
 
+def _prioritize_segment_delivery(transport):
+    """Best-effort QoS for one client-facing segment response.
+
+    Every option here is optional kernel/platform behaviour - a missing
+    constant or a permission error must never break segment delivery, only
+    skip the hint. Applied per-connection (not on the listening socket):
+    SO_PRIORITY/IP_TOS are socket options, not guaranteed to survive
+    accept() the same way on every kernel, so setting them on the actual
+    client socket is the reliable point.
+    """
+    try:
+        transport.setTcpNoDelay(True)
+    except Exception:
+        pass
+    try:
+        sock = transport.getHandle()
+    except Exception:
+        return
+    try:
+        # SO_PRIORITY (Linux): outbound queuing-discipline priority, 0-6.
+        # Segments compete on the same box with EPG/API polling and the
+        # web UI - bias the actual stream data above that best-effort
+        # traffic.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_PRIORITY, 6)
+    except Exception:
+        pass
+    try:
+        # IP_TOS / DSCP CS5 (0xA0): tells the network path (if the
+        # router/AP honours DSCP-to-WMM mapping) this is near-real-time
+        # media, not ordinary best-effort HTTP - matters most on the
+        # actual bottleneck link, the STB's WiFi/LAN hop to the player.
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0xA0)
+    except Exception:
+        pass
+
+
 class HlsRoot(Resource):
     def __init__(self, stream_service, logger, settings, local_ip_provider):
         Resource.__init__(self)
@@ -717,6 +754,12 @@ class HlsRoot(Resource):
             # chunks, only when the socket can take more.
             try:
                 client_ip = request.getClientIP()
+                # Segment filenames are monotonically increasing and never
+                # reused (see Segmenter.segment_path) - a given URI's bytes
+                # never change, so it is safe to tell any client/cache to
+                # keep it indefinitely once fetched.
+                request.setHeader(b"Cache-Control", b"public, max-age=31536000, immutable")
+                _prioritize_segment_delivery(request.transport)
                 resource = static.File(filepath, defaultType="video/MP2T")
                 resource.contentTypes = {".ts": "video/MP2T"}
                 resource.isLeaf = True
