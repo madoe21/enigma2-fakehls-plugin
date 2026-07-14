@@ -9,7 +9,7 @@ import stat
 import threading
 import time
 
-from .ffmpeg_service import async_start_ffmpeg, build_stream_url, mask_credentials, uses_stream_relay
+from .gst_service import async_start_gst, build_stream_url, mask_credentials, uses_stream_relay
 from .mpegts import (
     TS_PACKET_SIZE,
     find_keyframe_cut,
@@ -22,6 +22,14 @@ QUALITY_PRESETS = {
     "low_latency":  {"label": "Niedrige Latenz (1s)",           "seg_duration": 1},
     "balanced":     {"label": "Ausgewogen (2s)",                 "seg_duration": 2},
     "stable":       {"label": "Stabil (4s)",                     "seg_duration": 4},
+    # Longer segments (fewer HTTP round-trips per minute of content, more
+    # slack for the segmenter to absorb a tuner/network hiccup before a
+    # fetch notices) plus the live-edge hold-back below (see Segmenter)
+    # are what actually makes this smoother on Roku's native HLS player -
+    # it's markedly less forgiving about segment-fetch jitter than
+    # browser MSE players (Shaka/hls.js), which retry/rebuffer instead of
+    # stalling outright.
+    "roku":         {"label": "Roku / Set-Top (6s)",             "seg_duration": 6},
 }
 
 
@@ -214,6 +222,28 @@ class Segmenter(threading.Thread):
     # this thread back-pressures ffmpeg and, via TCP, the tuner stream itself,
     # which shows up as picture artifacts. 1 MB buys ~1 s of slack.
     PIPE_BUFFER_BYTES = 1 << 20
+
+    # Live-edge hold-back: a just-finished segment is kept out of the
+    # published playlist until this many more real segments have landed
+    # after it. A player is then never handed the segment that only just
+    # finished cutting - by the time it's advertised, the segmenter has
+    # already gone on to produce more, so a brief stall in that production
+    # (tuner hiccup, disk write, GC pause) never reaches the player as a
+    # missing/late segment. Costs HOLD_BACK * seg_duration extra live
+    # latency; the trade-off Roku's native HLS player (far less forgiving
+    # of fetch jitter than browser MSE players) needs to stop stuttering.
+    LIVE_EDGE_HOLD_BACK = 2
+
+    # How many segments back from the live edge a *fresh* player is told to
+    # start (#EXT-X-START below) - distinct from LIVE_EDGE_HOLD_BACK, which
+    # controls what's in the playlist at all. Without this tag every player
+    # picks its own start position by its own heuristic (observed: VLC sits
+    # ~4 segments back and plays smoothly; Shaka/hls.js start almost at the
+    # last segment and are far more exposed to any production hiccup,
+    # despite their own client-side prebuffer wait - that wait only delays
+    # when play() fires, it doesn't move the playback position itself).
+    # EXT-X-START standardises the start position across all of them.
+    LIVE_EDGE_START_SEGMENTS = 4
 
     def __init__(self, stream_id, settings, logger, seg_duration=None):
         threading.Thread.__init__(self)
@@ -420,6 +450,21 @@ class Segmenter(threading.Thread):
         except Exception as exc:
             self.logger.error("Error writing segment " + str(self.segment_index) + ": " + str(exc))
 
+    def _visible_real_segments(self):
+        """Real (non-filler) segments past the live-edge hold-back — i.e.
+        the ones actually eligible to appear in the published playlist."""
+        real_segments = [seg for seg in self.segments if not seg[4]]
+        if len(real_segments) > self.LIVE_EDGE_HOLD_BACK:
+            return real_segments[:-self.LIVE_EDGE_HOLD_BACK] if self.LIVE_EDGE_HOLD_BACK else real_segments
+        return []
+
+    def has_visible_real_segment(self):
+        """True once a real segment is actually visible in the published
+        playlist (past the hold-back) - not merely cut. Mirrors what
+        _update_playlist would show, so a caller polling readiness never
+        sees True while the playlist itself still lists only filler."""
+        return bool(self._visible_real_segments())
+
     def _update_playlist(self):
         try:
             # The filler clip is an independently-encoded standalone file
@@ -431,14 +476,30 @@ class Segmenter(threading.Thread):
             # resolution/profile change to append across it, which browsers
             # handle poorly to begin with - and Shaka's live-edge start
             # position for a *freshly ready* stream (barely any real content
-            # yet) can easily land exactly there. Once any real segment
-            # exists, stop advertising filler ones at all so a client never
-            # has a reason to cross that boundary; VLC never depended on
-            # them being listed either. Filler files still get cleaned up
-            # normally via segment retention/cleanup_all - only the
-            # playlist's view of them changes here.
-            real_segments = [seg for seg in self.segments if not seg[4]]
-            source = real_segments if real_segments else self.segments
+            # yet) can easily land exactly there. Once a real segment is
+            # visible (past LIVE_EDGE_HOLD_BACK), stop advertising filler
+            # ones at all so a client never has a reason to cross that
+            # boundary; VLC never depended on them being listed either.
+            # Filler files still get cleaned up normally via segment
+            # retention/cleanup_all - only the playlist's view of them
+            # changes here.
+            visible_real = self._visible_real_segments()
+            if visible_real:
+                source = visible_real
+            else:
+                # Nothing has cleared the hold-back yet - show filler only
+                # (if any). Never fall back to the raw, unfiltered segment
+                # list here: with a filler segment still in it that would
+                # mix filler and a not-yet-visible real segment in the same
+                # playlist, exactly the profile/timeline jump this whole
+                # filler-hiding scheme exists to prevent.
+                source = [seg for seg in self.segments if seg[4]]
+            if not source:
+                # No filler asset and nothing past the hold-back yet -
+                # leave the playlist as-is (or unwritten) rather than crash
+                # on an empty window; the caller's poll/redirect fallback
+                # covers "not ready yet" already.
+                return
 
             active = source[-self.settings.playlist_size():]
             first_seq = active[0][0]
@@ -451,6 +512,14 @@ class Segmenter(threading.Thread):
             content += "#EXT-X-VERSION:3\n"
             content += "#EXT-X-TARGETDURATION:" + str(self._target_duration) + "\n"
             content += "#EXT-X-MEDIA-SEQUENCE:" + str(first_seq) + "\n"
+            # RFC 8216 §4.3.5: negative TIME-OFFSET is relative to the last
+            # segment. PRECISE=YES asks for that exact point rather than
+            # the nearest segment boundary. If the offset exceeds the
+            # playlist's total duration (e.g. still early in the filler
+            # phase) compliant clients clamp to the start of the playlist
+            # instead of erroring - nothing to guard here.
+            start_offset = self.LIVE_EDGE_START_SEGMENTS * self._seg_duration
+            content += "#EXT-X-START:TIME-OFFSET=-%.3f,PRECISE=YES\n" % start_offset
 
             # A PCR discontinuity (e.g. ffmpeg's -reconnect firing mid-stream
             # on a flaky source) splices two unrelated decode timelines
@@ -636,7 +705,7 @@ class StreamService(object):
         # The lambdas bind this registration's segmenter so a late callback
         # from a previous life of the same stream_id (deterministic MD5) can
         # be recognised as stale and ignored.
-        async_start_ffmpeg(
+        async_start_gst(
             stream_url,
             segmenter.pipe_path,
             stream_id,
@@ -737,8 +806,8 @@ class StreamService(object):
             if process is not None:
                 self.logger.info("Stream " + stream_id + " started (mode=copy)")
             else:
-                self.logger.error("Failed to start FFmpeg for stream " + stream_id)
-                # Clean up — the segmenter is still running but ffmpeg failed.
+                self.logger.error("Failed to start stream " + stream_id)
+                # Clean up — the segmenter is still running but the pipeline failed.
                 self._stop_stream(stream_id, delete_files=True)
 
     def _stop_stream(self, stream_id, delete_files=False):
@@ -837,7 +906,9 @@ class StreamService(object):
             self.streams[stream_id]["last_accessed"] = time.time()
 
     def has_real_data(self, stream_id):
-        """True once at least one non-filler segment has been cut.
+        """True once a non-filler segment is actually visible in the
+        published playlist (i.e. past the segmenter's live-edge hold-back,
+        not merely cut - see Segmenter.has_visible_real_segment).
 
         Lets a caller wait for real content instead of the filler before
         handing a URL to a player that would otherwise have to sit through
@@ -849,7 +920,7 @@ class StreamService(object):
         info = self.streams.get(stream_id)
         if info is None or info.get("segmenter") is None:
             return False
-        return any(not seg[4] for seg in info["segmenter"].segments)
+        return info["segmenter"].has_visible_real_segment()
 
     def get_status(self):
         status = {}

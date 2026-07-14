@@ -7,7 +7,7 @@ import os
 import re
 import urllib.parse
 
-from twisted.internet import reactor
+from twisted.internet import defer, reactor, threads
 from twisted.web import static
 from twisted.web.resource import Resource
 from twisted.web.server import NOT_DONE_YET, Site
@@ -83,6 +83,7 @@ video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: con
     <option value="low_latency">Original Niedrige Latenz (1s)</option>
     <option value="balanced" selected>Original Ausgewogen (2s)</option>
     <option value="stable">Original Stabil (4s)</option>
+    <option value="roku">Original Roku / Set-Top (6s)</option>
   </select>
 </div>
 <div id="bouquet-bar"><span>Bouquet:</span></div>
@@ -664,9 +665,15 @@ class HlsRoot(Resource):
         q_pass = args.get(b"pass", [None])[0]
         q_quality = args.get(b"quality", [None])[0]
         from ...core.stream_service import QUALITY_PRESETS
-        quality = q_quality.decode() if q_quality else "balanced"
+        # This is the OpenWebInterface-style path Roku/VLC use (README) -
+        # unlike the web player, they never send ?quality=, so the fallback
+        # here is what they actually get. "roku": longer segments + the
+        # segmenter's live-edge hold-back (see stream_service.py) for a
+        # native HLS player that's much less tolerant of fetch jitter than
+        # a browser MSE player.
+        quality = q_quality.decode() if q_quality else "roku"
         if quality not in QUALITY_PRESETS:
-            quality = "balanced"
+            quality = "roku"
         params = {
             "ref": ref,
             "quality": quality,
@@ -796,40 +803,74 @@ class HlsRoot(Resource):
     def render_api_bouquets(self, request):
         # Parse /etc/enigma2 directly — the plugin runs on the receiver, so no
         # OpenWebif round-trip is needed (and none may be installed).
-        try:
-            top_file = os.path.join(BOUQUET_DIR, "bouquets.tv")
-            if not os.path.exists(top_file):
-                self.logger.error("API bouquets: %s not found" % top_file)
-                return self._json_response(
-                    request, {"error": "bouquets.tv not found"}, 500)
-            bouquets = [
-                {"name": name, "ref": filename}
-                for name, filename in self._parse_top_bouquet_file(top_file)
-            ]
-            return self._json_response(request, bouquets)
-        except Exception as exc:
-            self.logger.error("API bouquets error: " + str(exc))
-            return self._json_response(request, {"error": str(exc)}, 500)
+        #
+        # Pure file I/O + regex, no enigma2-native calls involved (unlike
+        # channel name resolution below) — safe to run off the reactor
+        # thread entirely. Bouquet files can hold hundreds of lines and this
+        # endpoint is hit every time the web UI opens; parsing it inline
+        # used to stall the reactor — which also drives the GUI and the
+        # port-8001 stream source ffmpeg reads from (see
+        # _redirect_when_playlist_ready's docstring) — for however long
+        # that took, stuttering every stream already playing.
+        top_file = os.path.join(BOUQUET_DIR, "bouquets.tv")
+        if not os.path.exists(top_file):
+            self.logger.error("API bouquets: %s not found" % top_file)
+            return self._json_response(
+                request, {"error": "bouquets.tv not found"}, 500)
+
+        state = {"gone": False}
+        request.notifyFinish().addErrback(lambda _f: state.update(gone=True))
+
+        def on_parsed(entries):
+            if state["gone"]:
+                return
+            bouquets = [{"name": name, "ref": filename} for name, filename in entries]
+            request.write(self._json_response(request, bouquets))
+            request.finish()
+
+        def on_failure(failure):
+            if state["gone"]:
+                return
+            self.logger.error("API bouquets error: " + str(failure.value))
+            request.write(self._json_response(request, {"error": str(failure.value)}, 500))
+            request.finish()
+
+        threads.deferToThread(self._parse_top_bouquet_file, top_file).addCallbacks(on_parsed, on_failure)
+        return NOT_DONE_YET
 
     def render_api_channels(self, request):
         ref_raw = request.args.get(b"ref", [None])[0]
         if not ref_raw:
             return self._json_response(request, {"error": "Missing ref"}, 400)
         ref = urllib.parse.unquote(ref_raw.decode())
-        try:
-            # Accept either a bouquet filename (as returned by /api/bouquets)
-            # or a full '1:7:1:...FROM BOUQUET "file"...' service reference.
-            match = re.search(r'FROM BOUQUET "([^"]+)"', ref)
-            filename = match.group(1) if match else ref
-            # basename() blocks path traversal via crafted refs
-            path = os.path.join(BOUQUET_DIR, os.path.basename(filename))
-            if not os.path.exists(path):
-                return self._json_response(
-                    request, {"error": "Bouquet not found: " + filename}, 404)
-            return self._json_response(request, self._channels_for(path))
-        except Exception as exc:
-            self.logger.error("API channels error: " + str(exc))
-            return self._json_response(request, {"error": str(exc)}, 500)
+        # Accept either a bouquet filename (as returned by /api/bouquets)
+        # or a full '1:7:1:...FROM BOUQUET "file"...' service reference.
+        match = re.search(r'FROM BOUQUET "([^"]+)"', ref)
+        filename = match.group(1) if match else ref
+        # basename() blocks path traversal via crafted refs
+        path = os.path.join(BOUQUET_DIR, os.path.basename(filename))
+        if not os.path.exists(path):
+            return self._json_response(
+                request, {"error": "Bouquet not found: " + filename}, 404)
+
+        state = {"gone": False}
+        request.notifyFinish().addErrback(lambda _f: state.update(gone=True))
+
+        def on_ready(channels):
+            if state["gone"]:
+                return
+            request.write(self._json_response(request, channels))
+            request.finish()
+
+        def on_failure(failure):
+            if state["gone"]:
+                return
+            self.logger.error("API channels error: " + str(failure.value))
+            request.write(self._json_response(request, {"error": str(failure.value)}, 500))
+            request.finish()
+
+        self._channels_for(path).addCallbacks(on_ready, on_failure)
+        return NOT_DONE_YET
 
     def render_api_start(self, request):
         ref_raw = request.args.get(b"ref", [None])[0]
@@ -953,22 +994,38 @@ class HlsRoot(Resource):
         return None
 
     def _channels_for(self, path):
-        """Return cached channel list for *path*, keyed by (path, mtime)."""
+        """Deferred list of channels for *path*, cached by (path, mtime).
+
+        Split in two stages so only the safe half leaves the reactor
+        thread: _parse_channel_file is plain file I/O/regex (no enigma2
+        calls) and runs in a worker thread via deferToThread;
+        _resolve_channel_names calls enigma2-native eServiceCenter, whose
+        thread-safety off the GUI/reactor thread is unverified on this
+        platform, so it stays on the reactor thread — deferToThread's
+        callback already fires back there.
+        """
         try:
             st = os.stat(path)
             key = (path, st.st_mtime)
         except OSError:
-            return []
+            return defer.succeed([])
 
         cached = self._channels_cache.get(key)
         if cached is not None:
-            return cached
+            return defer.succeed(cached)
 
-        channels = self._parse_channel_file(path)
-        self._channels_cache[key] = channels
-        return channels
+        def on_parsed(raw_channels):
+            channels = self._resolve_channel_names(raw_channels)
+            self._channels_cache[key] = channels
+            return channels
+
+        return threads.deferToThread(self._parse_channel_file, path).addCallback(on_parsed)
 
     def _parse_channel_file(self, path):
+        """Pure parse: refs plus any #DESCRIPTION-supplied names.
+
+        No enigma2-native calls — safe to run off the reactor thread.
+        """
         channels = []
         current_service = None
 
@@ -991,8 +1048,13 @@ class HlsRoot(Resource):
                     if description:
                         current_service["name"] = description
 
-        # Most bouquet files carry no #DESCRIPTION — channel names live in
-        # enigma2's service database (lamedb), so resolve them there.
+        return channels
+
+    def _resolve_channel_names(self, channels):
+        """Fill in names missing from #DESCRIPTION via enigma2's service
+        database (lamedb). Calls eServiceCenter — must run on the reactor
+        thread (see _channels_for).
+        """
         for channel in channels:
             if not channel["name"]:
                 channel["name"] = self._resolve_service_name(channel["ref"])
@@ -1070,11 +1132,19 @@ class HlsHttpServer(object):
             self._listener = None
 
     def restart(self):
+        """Stop and restart the HTTP server after a brief delay.
+
+        The delay must never be a blocking time.sleep(): this runs on the
+        Twisted reactor thread, which is also enigma2's main event loop
+        (GUI + the port-8001 stream source ffmpeg reads from, see
+        _redirect_when_playlist_ready's docstring) - sleeping here would
+        stall live playback for every other stream for the full delay.
+        reactor.callLater schedules the resume without blocking it.
+        """
         self.stream_service.stop_all()
         self.stop()
+        reactor.callLater(1, self._finish_restart)
 
-        import time
-
-        time.sleep(1)
+    def _finish_restart(self):
         self.start()
         self.logger.info("Server restarted")

@@ -81,6 +81,13 @@ class FakeSegmenter(object):
     def cleanup_all(self):
         pass
 
+    def has_visible_real_segment(self):
+        # Mirrors Segmenter.has_visible_real_segment(): a real segment only
+        # counts once it's past the live-edge hold-back, not merely cut.
+        hold_back = stream_service.Segmenter.LIVE_EDGE_HOLD_BACK
+        real = [seg for seg in self.segments if seg and not seg[4]]
+        return len(real) > hold_back
+
 
 class StreamServiceTest(unittest.TestCase):
     def setUp(self):
@@ -137,10 +144,25 @@ class StreamServiceTest(unittest.TestCase):
         service.streams["abcd1234"] = {"segmenter": segmenter}
         self.assertFalse(service.has_real_data("abcd1234"))
 
-    def test_has_real_data_true_once_real_segment_appended(self):
+    def test_has_real_data_false_within_live_edge_hold_back(self):
+        # A real segment that has been cut but not yet cleared the
+        # segmenter's live-edge hold-back must not read as "ready" -
+        # has_real_data must match what the playlist actually shows.
         service = self._service()
         segmenter = FakeSegmenter(segment_count=0)
         segmenter.segments = [(0, "p0", 0, 2.0, True), (1, "p1", 0, 2.0, False)]
+        service.streams["abcd1234"] = {"segmenter": segmenter}
+        self.assertFalse(service.has_real_data("abcd1234"))
+
+    def test_has_real_data_true_once_real_segment_appended(self):
+        service = self._service()
+        segmenter = FakeSegmenter(segment_count=0)
+        segmenter.segments = [
+            (0, "p0", 0, 2.0, True),
+            (1, "p1", 0, 2.0, False),
+            (2, "p2", 0, 2.0, False),
+            (3, "p3", 0, 2.0, False),
+        ]
         service.streams["abcd1234"] = {"segmenter": segmenter}
         self.assertTrue(service.has_real_data("abcd1234"))
 

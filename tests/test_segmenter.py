@@ -71,13 +71,23 @@ class SegmenterTest(unittest.TestCase):
         self.assertIn("abcd1234_pipe", os.path.basename(self.segmenter.pipe_path))
 
     def test_write_segment_creates_file_and_playlist(self):
-        self._write_segments(1)
+        # LIVE_EDGE_HOLD_BACK=2: segment 0 only clears the hold-back once
+        # 2 more real segments land behind it.
+        self._write_segments(3)
         self.assertTrue(os.path.exists(self.segmenter.segment_path(0)))
         content = self._playlist_content()
         self.assertIn("#EXTM3U", content)
         self.assertIn("#EXTINF:2.000,", content)
         self.assertIn("abcd1234_seg00000.ts", content)
         self.assertNotIn("http://", content)
+
+    def test_playlist_advertises_live_edge_start_offset(self):
+        # LIVE_EDGE_START_SEGMENTS=4 * seg_duration=2 -> -8.000. Standardises
+        # where a fresh player starts (RFC 8216 EXT-X-START) instead of
+        # leaving it to each player's own live-edge heuristic.
+        self._write_segments(3)
+        content = self._playlist_content()
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-8.000,PRECISE=YES", content)
 
     def test_tiny_segment_is_skipped(self):
         self.segmenter._write_segment(bytes(1024), 2.0)
@@ -87,11 +97,13 @@ class SegmenterTest(unittest.TestCase):
     def test_playlist_window_and_media_sequence(self):
         self._write_segments(5)
         content = self._playlist_content()
-        # playlist_size = 3 -> newest three segments, sequence starts at 2
-        self.assertIn("#EXT-X-MEDIA-SEQUENCE:2", content)
-        self.assertNotIn("abcd1234_seg00001.ts", content)
+        # 5 real segments minus LIVE_EDGE_HOLD_BACK=2 -> segments 0-2 are
+        # visible (3, exactly playlist_size); 3 and 4 are still held back.
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:0", content)
+        self.assertIn("abcd1234_seg00000.ts", content)
         self.assertIn("abcd1234_seg00002.ts", content)
-        self.assertIn("abcd1234_seg00004.ts", content)
+        self.assertNotIn("abcd1234_seg00003.ts", content)
+        self.assertNotIn("abcd1234_seg00004.ts", content)
 
     def test_write_initial_segment_is_flagged_as_filler(self):
         # Regression: write_initial_segment() forgot to pass is_filler=True
@@ -117,7 +129,9 @@ class SegmenterTest(unittest.TestCase):
         # playlist entirely so a client has no reason to ever cross it.
         self.segmenter._filler_bytes = bytes(16 * 1024)
         self.segmenter.write_initial_segment()
-        self._write_segments(1)  # a real segment via the normal path
+        # 3 real segments (indices 1-3): LIVE_EDGE_HOLD_BACK=2 clears only
+        # the first of them (index 1).
+        self._write_segments(3)
         content = self._playlist_content()
         self.assertNotIn("#EXT-X-DISCONTINUITY", content)
         self.assertNotIn("abcd1234_seg00000.ts", content)
@@ -130,6 +144,8 @@ class SegmenterTest(unittest.TestCase):
         # too, or MSE rejects the append with nothing to explain why.
         self._write_segments(1)
         self.segmenter._write_segment(bytes(16 * 1024), 2.0, is_discontinuity=True)
+        # 2 more real segments to push the pair above past the hold-back.
+        self._write_segments(2)
         content = self._playlist_content()
         self.assertIn("#EXT-X-DISCONTINUITY", content)
         first_pos = content.index("abcd1234_seg00000.ts")
@@ -140,6 +156,9 @@ class SegmenterTest(unittest.TestCase):
     def test_no_discontinuity_tag_before_first_listed_segment(self):
         # Not meaningful for a client just joining - nothing precedes it.
         self.segmenter._write_segment(bytes(16 * 1024), 2.0, is_discontinuity=True)
+        # 2 more real segments so the discontinuous one clears the
+        # hold-back and becomes the first (and only) visible entry.
+        self._write_segments(2)
         content = self._playlist_content()
         self.assertNotIn("#EXT-X-DISCONTINUITY", content)
 
@@ -148,6 +167,22 @@ class SegmenterTest(unittest.TestCase):
         self.segmenter.write_initial_segment()
         content = self._playlist_content()
         self.assertIn("abcd1234_seg00000.ts", content)
+
+    def test_live_edge_hold_back_delays_playlist_visibility(self):
+        # LIVE_EDGE_HOLD_BACK=2: a segment must not appear in the playlist
+        # (or count as "visible") until 2 more real segments exist behind
+        # it - the whole point being that a player is never handed the
+        # segment that JUST finished cutting.
+        self._write_segments(1)
+        self.assertFalse(self.segmenter.has_visible_real_segment())
+        self._write_segments(1)
+        self.assertFalse(self.segmenter.has_visible_real_segment())
+        self._write_segments(1)
+        self.assertTrue(self.segmenter.has_visible_real_segment())
+        content = self._playlist_content()
+        self.assertIn("abcd1234_seg00000.ts", content)
+        self.assertNotIn("abcd1234_seg00001.ts", content)
+        self.assertNotIn("abcd1234_seg00002.ts", content)
 
     def test_old_segment_files_are_deleted(self):
         self._write_segments(6)
@@ -184,6 +219,9 @@ class SegmenterTest(unittest.TestCase):
     def test_target_duration_covers_longest_segment(self):
         self.segmenter._write_segment(bytes(16 * 1024), 2.0)
         self.segmenter._write_segment(bytes(16 * 1024), 3.4)
+        # 2 more so the pair above (durations 2.0, 3.4) clears the
+        # LIVE_EDGE_HOLD_BACK=2 window and is actually visible.
+        self._write_segments(2)
         self.assertIn("#EXT-X-TARGETDURATION:4", self._playlist_content())
 
     def test_target_duration_never_decreases(self):
