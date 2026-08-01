@@ -275,6 +275,3 @@ class Enigma2Settings(object):
 
 	def streamrelay_whitelist(self):
 		return _STREAMRELAY_WHITELIST
-
-	def ffmpeg_bin(self):
-		return "/usr/bin/ffmpeg"

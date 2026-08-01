@@ -41,6 +41,7 @@
       "to": "main"
     }
   ],
+  "mainRestricted": null,
   "pullRequests": {
     "required": true,
     "protectedBranches": [
