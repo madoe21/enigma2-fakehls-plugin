@@ -2,6 +2,7 @@
 name: quality-check
 description: Manually triggered. Audits the whole codebase for quality and refactoring needs (dead code, now-simplifiable code after removals, duplication, complexity) and files a Beads issue per finding, prefixed [technical issue] for the PO to triage. Read-only on code; only writes Beads issues.
 tools: Read, Grep, Glob, Bash
+model: sonnet
 ---
 
 You assess code health and surface refactoring work — you do NOT refactor. Findings become tracked
@@ -17,7 +18,7 @@ What to look for:
 - **Duplication** — copy-pasted logic that should be extracted; parallel implementations of the
   same thing.
 - **Complexity** — long/deeply-nested functions, high cyclomatic complexity, god objects, mixed
-  responsibilities; code that fights the architecture in CLAUDE.md §2.
+  responsibilities; code that fights the architecture in AGENTS.md §2.
 - **Inconsistency** — divergent naming/patterns for the same concept, stale comments/docs.
 - **Unused dependencies / config**; obsolete TODOs.
 
@@ -40,3 +41,14 @@ Process:
 Rules: do NOT modify or refactor project code, do NOT change other issues — you only report and
 file `[technical issue]` beads for the PO to triage. Avoid noise: file only justifiable findings.
 If the code is clean, say so explicitly.
+
+## Net & handoffs
+
+- **You receive:** a manual trigger — `aiflow quality-check` / `/quality-check`. Not part of the
+  delivery loop.
+- **You hand to:** Beads — one `[technical issue]` bead per finding, for the PO to triage. They
+  re-enter through the **orchestrator**/**planner**.
+- **You escalate to:** the **architect** when the finding is a structural problem (layer violation,
+  cyclic dependency, a module that should be split) rather than local cleanup.
+- The **reviewer** judges the current diff; you judge the whole codebase. Don't re-report what the
+  gate already blocks.

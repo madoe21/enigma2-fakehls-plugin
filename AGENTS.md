@@ -1,128 +1,767 @@
-# Agent Instructions
+# Project Operating Rules (aiflow)
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+<!-- aiflow config flags - tooling reads these -->
+<!-- AIFLOW_MEMORY: on -->
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+This file governs how AI coding agents work in this repo â€” **agent-agnostic**: Claude Code,
+GitHub Copilot, OpenAI Codex CLI, or any tool that reads a repo-root instructions file. It is the
+single source of truth shared by interactive sessions and headless/CI runs. Edit the sections
+marked **[EDIT ME]** for your project.
 
-## Quick Reference
+Sections marked **(Claude Code only)** describe subagents/hooks/slash-commands that only Claude
+Code can invoke automatically. Every other agent still follows the same workflow and rules â€”
+manually, step by step, in the order described â€” it just doesn't get the automated
+dispatch/enforcement. `CLAUDE.md` in this repo root is a one-line pointer that makes Claude Code
+load this exact file; Codex CLI and most other tools read `AGENTS.md` directly by convention.
+GitHub Copilot reads `.github/copilot-instructions.md`, which also just points here.
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+---
+
+## 1. Project overview  [EDIT ME]
+
+> One paragraph: what this project is, who uses it, the tech stack.
+> Replace this block.
+
+- **Stack:** <language / framework>
+- **Entry point:** <main file / app start>
+- **Run locally:** <command>
+- **Test:** <command>
+
+> **Project aim (fill it in â€” the cheapest quality lever).** Every agent reads the aim before
+> planning or coding; without it it works generically instead of tuned to *this* project.
+> Set it via `aiflow init` / `aiflow change-settings`, or write it manually here **and** in
+> `.claude/memory/project-aim.md`. 2â€“4 plain sentences: *what* the product does, *for whom*,
+> the *target architecture*, the *quality bar*. On a brownfield project, `aiflow onboard`
+> proposes an aim from the code â€” confirm or correct it, never leave it `PROPOSED`.
+
+---
+
+## 2. Architecture rules (MANDATORY)
+
+These rules apply to **every** task, in every language â€” Java/Kotlin, Swift/Objective-C, Dart,
+TypeScript, C#, Rust, Go, Python, C/C++ on embedded. The vocabulary differs per ecosystem
+(package/module/crate/framework/target); the structure does not. Â§2a is binding everywhere; Â§2b is
+where **this** project's concrete decisions go.
+
+### 2a. Binding rules
+
+**Layered architecture.** Every project has explicit layers and a single dependency direction â€”
+inward, toward the domain:
+
+```
+presentation / API   (controllers, UI, CLI, ISR handlers)
+        â†“
+application / service (use cases, orchestration, transactions)
+        â†“
+domain               (entities, value objects, business rules â€” depends on nothing)
+        â†‘
+infrastructure       (persistence, HTTP clients, brokers, drivers â€” implements domain ports)
 ```
 
-## Non-Interactive Shell Commands
+- **No layer skips.** A controller never touches a repository or a driver directly.
+- **The domain imports nothing outward.** No ORM annotations bleeding business rules, no HTTP types
+  in entities, no vendor SDK in the domain. Infrastructure depends on the domain, never the reverse.
+- **No cyclic dependencies** between modules/packages. A cycle is a defect, not a style opinion.
+- Embedded equivalent: `application â†” service â†” HAL/driver`. Business logic never talks to a
+  register directly; the HAL is the port.
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+**Interfaces at every seam.** Anything crossing a layer or module boundary is reached through an
+interface (protocol/trait/abstract type), never a concrete class:
+- The domain declares the **port** (`OrderRepository`, `PaymentGateway`); infrastructure provides
+  the **adapter**. Wire them by dependency injection, never by `new`-ing inside the caller.
+- A public API contract and its implementation live in separate types. Internal helpers stay
+  internal (package-private / `internal` / not exported).
+- This is what makes the code testable: every boundary is mockable by construction.
 
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+**DAO and DTO are mandatory, and they are not the same object.**
+- **DAO / repository** â€” the *only* place that talks to a data store. No SQL, no query builder, no
+  ORM session, no file/registry access anywhere else. One DAO per aggregate, not per table-join.
+- **DTO** â€” what crosses a process boundary (REST/SOAP/queue payloads, UI view models). Mapped
+  explicitly to/from domain objects.
+- **Domain objects never leave the domain** â€” not serialised to a client, not persisted verbatim,
+  not accepted as request bodies. An entity annotated for both JPA and JSON is a review finding:
+  it couples the database schema to the wire format, so neither can change independently.
 
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
+**Reusability before duplication.** Before writing something new: does it exist in this codebase,
+in the standard library, in an already-installed dependency? Extract shared behaviour into a
+common module rather than copying it. **Generics/type parameters** are the right tool when the same
+logic differs only by type (`Repository<T, ID>`, `Result<T, E>`, a typed mapper) â€” use them to kill
+duplication, not to build speculative abstraction layers (Â§3a: YAGNI).
 
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
+**Complexity is the enemy.**
+- Split a complex task into **small, single-purpose methods** with self-explanatory names. A method
+  that needs a comment to explain *what* it does wants to be two methods.
+- Guard clauses over nesting; no deep `if`-pyramids; no god classes/functions.
+- Cognitive and cyclomatic complexity stay within the Â§3a metric targets. Every extra branch,
+  flag parameter, and special case has to earn its place.
+
+**Style.** Google Style per Â§3 â€” mandatory, no exceptions. Formatter and linter run before a task
+is done.
+
+### 2b. This project's architecture  [EDIT ME]
+
+> Concrete decisions for **this** codebase. Replace the placeholders. If this block is still
+> unfilled when the first real task arrives, the **architect** agent fills it (see below).
+
+- Layer names + directories: `<dir> -> <dir> -> <dir>`
+- Module/package boundaries and what may depend on what: `<...>`
+- Public API lives in `<dir>`; internal helpers in `<dir>`.
+- Persistence: `<db / ORM>`; DAOs in `<dir>`; migrations in `<dir>`.
+- DTO â†” domain mapping: `<mapper approach / dir>`
+- Errors: never swallow; wrap with context. Project error type: `<...>`
+- Full architecture document: `docs/architecture/` (arc42) + ADRs. Update it when structure changes.
+
+### 2c. Rules must exist â€” and they win
+
+- **A project without architecture rules gets them.** If Â§2b is still a placeholder and no ADR
+  defines the structure, the **architect** agent (`/arch`) proposes a sensible set on first use â€”
+  layering, module boundaries, DAO/DTO convention, interface policy, naming/package structure â€”
+  writes it into Â§2b **and** as an ADR under `docs/architecture/`, and has it confirmed. On a
+  brownfield codebase the **onboarder** derives the *actual* rules from the code first and flags
+  where reality already contradicts them.
+- **Once recorded, the rules are binding.** They change only through a new ADR that explicitly
+  supersedes the old one â€” never silently, never as a side effect of a feature task.
+- **A task that doesn't fit the architecture is not implemented as-is.** When a requirement would
+  break a rule in Â§2a/Â§2b, the agent **stops before writing code** and asks â€” in PO-understandable
+  language, with options and consequences (e.g. *"putting this query in the controller saves a day
+  now, but no other feature can reuse it and the DB type leaks into the API"*). The user decides;
+  the decision is recorded (`/beads:decision` **(Claude Code only)**, or `bd update <id> --design`).
+  Improvising around a rule, or "just this once", is a review BLOCKER.
+- The **reviewer** checks Â§2a/Â§2b explicitly (Â§5) â€” layer violations, missing interfaces at seams,
+  domain objects on the wire, missing DAO/DTO separation, avoidable complexity, copy-paste instead
+  of reuse â€” and each of those is a BLOCKER, not a suggestion.
+
+---
+
+## 3. Code style â€” Google Style, every language (MANDATORY)
+
+All code follows the **Google Style Guides** regardless of language:
+https://google.github.io/styleguide/
+
+Defaults the agent must apply:
+- **Indent:** spaces, not tabs (2 for most; 4 for Python).
+- **Line length:** 80â€“100 cols (language-specific Google limit).
+- **Naming:** Google conventions per language (e.g. `lowerCamelCase` vars in Java/JS/Dart/Go-exported, `snake_case` in Python, `PascalCase` types).
+- **Imports:** ordered & grouped per the relevant Google guide.
+- **Comments:** doc comments on every public symbol; explain *why*, not *what*.
+- **No dead code, no commented-out blocks** left behind.
+
+Per-language formatter/linter (run before declaring work done):
+| Language   | Formatter            | Linter            |
+|------------|----------------------|-------------------|
+| Python     | `black` + `isort`    | `pylint` (Google rc) / `ruff` |
+| JS/TS      | `prettier`           | `eslint` (google config) |
+| Java       | `google-java-format` | `checkstyle` (google_checks.xml) |
+| Go         | `gofmt`/`goimports`  | `golangci-lint`   |
+| Dart/Flutter | `dart format`      | `flutter analyze` |
+| C++        | `clang-format` (Google style) | `clang-tidy` |
+| Shell      | `shfmt`              | `shellcheck`      |
+
+If a formatter is missing, the agent still writes code in Google style by hand and
+notes the missing tool. The `format` hook auto-formats edited files when the tool exists
+**(Claude Code only â€” Copilot/Codex: run the formatter yourself before finishing).**
+
+---
+
+## 3a. Quality gates â€” analysis, tests, logging (MANDATORY, every implementation)
+
+**Static code analysis** happens on every implementation:
+- If the project provides a tool (SonarQube, a full linter suite, `spotbugs`, â€¦), run it and fix
+  what it reports on the touched code.
+- If **no tool** is available, the agent performs the analysis **itself**: scan the changed code
+  for code smells (long methods, deep nesting, god classes, magic values, dead code, duplication,
+  needless complexity) and fix them before finishing. "No tool" is not an excuse â€” **code smells
+  are never shipped**.
+
+**Test pyramid** (choose deliberately, don't skip silently):
+- **Unit tests â€” always mandatory.** > 80 % **line coverage** on the touched code, and **every
+  non-static method has a test**.
+- **End-to-end tests â€” always mandatory**, written in **BDD style** (Given/When/Then, e.g.
+  Gherkin/Cucumber or the project's BDD framework).
+- **Integration tests** and **system tests** â€” add them where they carry real signal (I/O
+  boundaries, service seams, cross-module flows). If skipped, say why in the handoff.
+- **BDD is mandatory** for end-to-end, system, and acceptance tests. Unit tests stay in the
+  project's normal test framework/style.
+- Prefer well-established test frameworks over hand-rolled harnesses.
+
+**Logging is part of quality:**
+- An application without logging is a quality defect â€” flag it and fix it in the code you touch.
+- Use **levels** correctly: `debug` (diagnostic detail), `info` (business events), `warn`
+  (recoverable anomaly), `error` (failure with context). Never log secrets or personal data.
+- Use the ecosystem's standard logging framework (slf4j/logback, `logging`, pino/winston, â€¦),
+  never `print`/`console.log` in production code.
+
+**Design principles** (implementer builds by them, reviewer verifies them):
+SOLID Â· DRY Â· KISS Â· YAGNI Â· high cohesion, low coupling Â· no cyclic dependencies Â· small
+methods/classes, self-explanatory names Â· error handling + input validation + null/Optional
+handling everywhere Â· thread safety where concurrency applies Â· testable by design (dependency
+injection, no hidden dependencies, deterministic, mockable).
+
+**Class size & KISS in practice:**
+- Classes stay small. A class ballooning into hundreds of lines is a signal to stop and apply
+  **divide & conquer**: split responsibilities, extract collaborators, encapsulate logic behind
+  **interfaces**. If that requires its own layer structure, it must be **coherent in itself and
+  consistent with the rest of the codebase** â€” no one-off layering.
+- Legitimate exception: utility classes/libraries consumed by other applications may offer the
+  same method in several overloads (different argument counts) for flexible call sites.
+
+**Production readiness & technology choices (MANDATORY):**
+- Every implementation targets **production**, not a demo. Be very careful with technology that
+  lacks maturity (experimental libraries, pre-1.0/alpha releases, unmaintained projects):
+  prefer proven alternatives, and if an immature choice is genuinely justified, record it as a
+  decision. **Reviewer and tester must flag low-maturity tech** in a change.
+- **State of the art is the default â€” question legacy choices.** If a requirement asks for
+  SOAP instead of REST, XML payloads on REST instead of JSON, or 1980s-style message-queue
+  patterns instead of modern brokers/cloud-native eventing (Kafka, NATS, RabbitMQ, K8s-native),
+  don't silently build it: ask **why** (PO-level question, options + consequences) and record
+  the decision. Outdated and end-of-life technology is a maintainability **and security** risk â€”
+  nothing is more fatal than systems whose stack has no support anymore.
+- **Avoid growing a monolith.** Even when microservices are not explicitly required, design
+  modular boundaries and service-ready seams so parts can be extracted later.
+- **Consider the data/performance architecture deliberately:** would an in-memory store
+  (**Redis**, **SQLite**) bring a measurable performance win? Would a search/caching layer
+  (**Elasticsearch**) decouple the database from the application and absorb read load? Evaluate
+  when the requirement touches performance or search, propose it to the PO, record the decision.
+
+**Metric targets** (objective â€” every agent honours them, the quality gate checks them):
+
+| Metric | Target |
+|--------|--------|
+| Cognitive / cyclomatic complexity | as low as practical; no new hotspots |
+| Code duplication | **0 % new** duplicates |
+| Code smells | **no new** smells |
+| Test coverage | **â‰¥ 80 %** of changed logic (lines); all non-static methods |
+| Architecture violations | **0** |
+| Linter warnings | **0** |
+| Compiler warnings | **0** |
+| Security findings | **0** high/critical |
+| API breaking changes | only with recorded justification |
+
+---
+
+## 3b. REST interfaces â€” versioning, security, `.http` files (MANDATORY)
+
+**Every REST API is versioned and secured:**
+- **Versioning from day one** â€” URI versioning (`/api/v1/â€¦`) as the default (or header/media-type
+  versioning if the project already uses it). Breaking changes go into a new version; old versions
+  get a documented deprecation window. An unversioned new API is a review finding.
+- **Real authentication/authorisation** â€” **Basic Auth is insufficient** for anything beyond a
+  throwaway local demo. Use the current standards: **OAuth 2.x / OpenID Connect**, JWT bearer
+  tokens (short-lived, validated signature + expiry + audience), or managed API keys with rotation;
+  mTLS where service-to-service traffic warrants it. Always HTTPS, never credentials in URLs,
+  authorisation checked per endpoint (not just "logged in").
+
+Every **new or changed REST endpoint** ships a matching **`.http` file** (IntelliJ HTTP Client /
+VS Code REST Client compatible) so it can be exercised straight from the IDE:
+
+- Location: `http/<resource>.http` â€” one file per resource/controller, one request block per
+  operation. Cover the happy path plus at least one auth and one error case.
+- **Host, port, test user, and password come from `.env`** (`APP_HOST`, `APP_PORT`,
+  `TEST_USERNAME`, `TEST_PASSWORD` â€” see `.env.example`). The agent **may read `.env`** to pick
+  the right values; if the keys are missing it adds them to `.env.example` and documents them.
+- Reference the values instead of hard-coding secrets: VS Code REST Client reads
+  `{{$dotenv APP_HOST}}` directly from `.env`; for IntelliJ keep a small `http-client.env.json`
+  (public values only) next to the files and put credentials in the **gitignored**
+  `http-client.private.env.json`.
+- Keep the files current â€” a changed endpoint with a stale `.http` file is a review finding.
+
+---
+
+## 3c. Database modelling rules (MANDATORY)
+
+Two regimes. Which one applies is decided **per schema object**, not per project: anything you
+create new follows the design rules; anything that already exists falls under the brownfield rules.
+
+### New data models (tables/schemas the agent creates)
+
+**Modelling**
+- **R1 â€” At least 3rd normal form.** Deliberate denormalisation only with a documented, measurable
+  performance win.
+- **R2 â€” No redundant data.** Each fact stored once; duplication must be justified.
+- **R3 â€” m:n only via junction tables.** Never ID lists or CSV values in a column.
+- **R4 â€” Real foreign keys** for every logical relationship â€” no "soft" references
+  (`customerId INT` without `REFERENCES Customer(id)` is a defect).
+- **R5 â€” No needless surrogate keys.** Junction tables get `PRIMARY KEY (UserId, RoleId)`, not an
+  extra `Id` â€” add one only when it's needed (other tables reference the row, or the relation
+  carries attributes).
+
+**Constraints**
+- **R6 â€” `NOT NULL` by default.** `NULL` only where "unknown / not applicable" is a real domain state.
+- **R7 â€” Business rules as `CHECK` constraints** where possible (`price >= 0`, `quantity > 0`,
+  `percentage BETWEEN 0 AND 100`).
+- **R8 â€” `UNIQUE` on every natural key**, not just primary keys.
+- **R9 â€” Precise data types** (`CHAR(2)` for an ISO country code, not `VARCHAR(500)`).
+- **R10 â€” No magic values** (`-1`, `999999`, `''`) in place of proper modelling.
+
+**Performance**
+- **R11 â€” Only necessary indexes:** primary keys, foreign keys, frequently filtered/sorted columns.
+  No index-everything strategy.
+- **R12 â€” Smallest sufficient type** (`SMALLINT` over `BIGINT` when it fits).
+- **R13 â€” Keep large objects out.** BLOBs/large text only when required; prefer storing files
+  outside the database.
+- **R14 â€” No overly wide tables.** Many optional columns usually signal a bad model.
+
+**Maintainability & integrity**
+- **R15 â€” One naming convention** â€” never mixes like `CustomerID` / `customer_id` / `CustId`.
+- **R16 â€” No cryptic abbreviations** (`User`, `Address`, `Order` â€” not `usr`, `adr`, `ord`).
+- **R17 â€” Lookup tables over status numbers** (`OrderStatus(Id, Name)` instead of `status = 1`)
+  when the set can grow; for truly static values (ISO codes, small enums) an ENUM/domain may fit â€”
+  make it a **project-wide decision** and record it.
+- **R18 â€” Referential integrity everywhere.** No orphaned rows possible.
+- **R19 â€” Cascades only deliberately.** `CASCADE DELETE` never by default â€” only when the domain
+  says the children die with the parent.
+- **R20 â€” Question every hard delete.** Use soft delete or history tables where the domain needs
+  traceability.
+
+### Existing data models (brownfield â€” handle with care)
+
+The B rules are **cautionary guidance, not absolute bans**. Why the caution: an existing schema
+may be shared by **other applications/projects** you can't see from this repo, and operations may
+need to **roll back to an older application version** that still expects the old structure. A
+schema change that looks like a pure improvement can break both. So:
+
+- **B1â€“B7 â€” don't do these as a side effect of a feature task:** restructuring existing models,
+  changing keys, adding constraints, changing data types, merging tables, splitting tables,
+  normalising after the fact. Default answer: leave the structure alone.
+- **B8 â€” note the improvement potential instead.** Record every schema problem you find (missing
+  FKs/constraints, unjustified NULL columns, redundant data, pointless surrogate keys, missing
+  UNIQUEs/indexes, normal-form violations, inconsistent naming) as a **recommendation** â€” a
+  `[technical issue]`/`[suggestion]` bead â€” for the PO to schedule deliberately.
+- **When a schema change IS commissioned** (explicitly, or the PO accepts a recommendation), treat
+  it as high-risk: check for **external consumers** of the schema first, plan **backward
+  compatibility / rollback** (expandâ€“contract migrations beat in-place changes), version the
+  migration, and take it through the review gate like any architecture change.
+
+---
+
+## 4. Task workflow (Beads + acceptance criteria)
+
+Work is tracked in **Beads** (`bd`), a Dolt-backed issue store shared by the whole team â€” same CLI
+regardless of which agent is driving it. Multi-step or multi-session work MUST be a bead. Beads
+issues live in a Dolt DB and sync via `refs/dolt/data` on the git remote â€” so several members
+share one issue graph.
+
+0. **Sync first (start of every session):** `aiflow sync` (= `git pull --rebase` + `bd dolt pull`)
+   so you see teammates' latest issues/status before picking work. Never work off a stale DB.
+1. **Pick + claim work atomically:** `bd ready --claim --json` claims the first ready, unassigned
+   bead (sets assignee = you, status = in_progress) in one step. To claim a specific one:
+   `bd update <id> --claim`. **Only work a bead you have claimed.** Check `bd ready --unassigned`
+   to see what's free; never start a bead already assigned to someone else.
+2. **Acceptance criteria:** every task has explicit, checkable AC. If missing, write them first and confirm before coding.
+   Functional questions are phrased so a **PO understands the hurdle** (plain language, options
+   with consequences); the user picks, and the decision is **recorded** (`/beads:decision`
+   **(Claude Code only)**, or `bd update <id> --design` from any agent).
+3. **Strategy first:** build a short pre-analysis (current architecture, how it changes, effort,
+   complexity) and gather missing information **before** writing code.
+4. **Implement:** smallest change that satisfies AC. Follow Â§2 architecture + Â§3 style + Â§3a/Â§3b
+   quality gates.
+5. **Verify:** run tests + formatter + linter + static analysis (Â§3a). AC must be demonstrably met.
+6. **Review gate:** one pass, two hats: **architect review** (architecture, design, risks) plus
+   the **quality-gate checklist** (Â§3a metrics, tests, docs) â€” run `/review-ac`
+   **(Claude Code only** â€” dispatches the `reviewer` subagent; other agents: read Â§3a/Â§5 and do
+   this pass yourself, or ask the user to review**)**. Fix every BLOCKER/SHOULD; out-of-scope
+   improvement ideas are persisted as `[suggestion]` beads for the next loop. When the
+   pre-analysis flagged high risk/complexity, a separate **tester** pass runs before the gate.
+7. **Commit:** reference the bead id in the message (see Â§7).
+8. **Close** the bead with a note on how AC were verified: `bd close <id> --reason "â€¦"`.
+9. **Sync gate (mandatory when enabled):** the moment a bead is closed locally, if
+   `.aiflow/config.json â†’ sync.askOnClose` is `true`, run `aiflow close-sync <bead-id>`.
+   It **asks** (never automatic) whether to `git push` and whether to Dolt-sync the issue DB.
+   It **pulls before it pushes** (`bd dolt pull` â†’ `bd dolt push`) so it never clobbers a
+   teammate's changes. Do not push or sync silently, and do not skip the prompt.
+10. **Continue the queue:** refresh it (`aiflow next`, or `bd ready --json`) and start the next
+    task. Closing a bead ends a *task*, not the session â€” see Â§4b.
+
+A task is **DONE** only when: AC met â€¢ quality gates Â§3a/Â§3b/Â§3c passed (tests + coverage, static
+analysis, logging, `.http` files, database rules) â€¢ style/lint clean â€¢ review gate passed â€¢
+decisions recorded â€¢ bead closed â€¢ sync gate honoured â€¢ queue refreshed (Â§4b).
+
+### 4b. Queue mode â€” work the queue, not one bead
+
+Beads is an authoritative **work queue**, not a notepad. There is a difference between "execute
+this task" and "work through the available tasks", and this project expects the second:
+
+```
+bd ready --json â†’ select â†’ claim â†’ inspect â†’ implement â†’ validate â†’ close â†’ refresh â†’ repeat
 ```
 
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+**Completing a task never ends the session by itself.** After closing a bead, re-run the queue
+check immediately and continue with the next appropriate task. Do not ask the user what to work
+on next while Beads already holds a ready one â€” announce which one you picked and why, then work
+it.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
-## Beads Issue Tracker
+**Selecting the next task** (`aiflow next` applies the first two mechanically and prints the
+winner; `--after <closed-id>` feeds it the third):
+1. higher priority (P0 first),
+2. a task that unblocks others,
+3. a task in the epic/workstream currently being implemented,
+4. a natural continuation of the task just closed (e.g. `discovered-from` it),
+5. otherwise the most appropriate ready task by description and dependencies.
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+Don't jump to unrelated work while a clear continuation of the current thread exists.
 
-### Quick Reference
+**Stop only for a real reason** â€” and say which one:
+- the queue holds nothing actionable (`aiflow next` exits 3),
+- everything left is blocked by unresolved dependencies (`bd blocked`),
+- continuing needs a decision, clarification, credentials, permission or information only the
+  user has,
+- the user said stop.
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
+"The task I was given is finished" is **not** one of them. Neither is a queue you did not look at.
+
+This is not left to memory: with Claude Code, the `Stop` hook `.claude/hooks/queue-continue.*`
+checks the queue when the agent tries to end its turn and hands back the next ready task. It
+fires **at most once** per stop, so stating a legitimate reason above always ends the session.
+Turn it off per project with `.aiflow/config.json â†’ beads.queueMode = false`, or for one session
+with `AIFLOW_QUEUE_MODE=off`. Copilot/Codex have no Stop-hook equivalent: run `aiflow next`
+yourself after every close.
+
+**Autonomy still has limits.** Queue mode does not authorise blanket execution of every open
+bead: the Â§4 gates (AC, review, decisions) apply to each task unchanged, work outside a bead's
+scope becomes a new bead rather than silent extra work, and the git/release rules in Â§7 â€”
+especially "never merge to `main` or release without explicit confirmation" â€” are untouched by it.
+
+### 4a. Team collaboration rules (multiple members, one issue graph)
+- **Single source of truth:** Beads only. Do NOT use TodoWrite / markdown TODOs / ad-hoc lists.
+- **Claim before you touch it.** The atomic `--claim` prevents two people grabbing the same bead.
+  If `bd` says a bead is already claimed by someone else, pick another.
+- **Pull before push, always.** Issue state is shared; `aiflow sync` / `aiflow close-sync` pull
+  first. On a Dolt conflict: `bd dolt pull` (merge), resolve, then push. Never force-push.
+- **Small, frequent syncs** beat big ones â€” push closed/updated beads promptly so others see them.
+- **Assignee + status are the coordination signal.** Keep status current (`in_progress` when you
+  start via `--claim`, `closed` when done). Stale status = wasted duplicate work.
+- **Discovered work â†’ a new bead** (`bd create â€¦ --deps discovered-from:<id>`), don't silently
+  expand scope; that keeps everyone's ready-list honest.
+- **Decisions** that affect others â†’ `/beads:decision` **(Claude Code only** â€” other agents:
+  `bd update <id> --design` or write the rationale directly into the bead**)**, not just a commit.
+
+---
+
+## 5. Agents (Claude Code only)
+
+Specialised subagents live in `.claude/agents/` and are dispatched automatically or via
+slash-commands â€” **this section only applies when Claude Code is driving.** GitHub Copilot and
+OpenAI Codex CLI have no equivalent subagent-dispatch mechanism today: follow the same roles and
+gates yourself, in the same order, reading the referenced section for each.
+
+### The network
+
+`/orchestrate` is the entry point for anything that isn't a single obvious edit. The
+**orchestrator** owns the route; every step is executed by exactly one specialist, and every
+handover goes **through the bead** (`bd update <id> --notes "route: â€¦"`), never through session
+context â€” a route that only exists in the conversation dies at the next `/compact`.
+
+```
+              user / VCS issue / goal
+                        â”‚
+                  [orchestrator] â—„â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                        â”‚  (routes, never implements)       â”‚
+        â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”                   â”‚
+        â–¼               â–¼               â–¼                   â”‚
+   [onboarder]     [planner]      [architect]                â”‚
+   codebase map   beads + AC +    ADR + arc42                â”‚
+        â”‚         agent per bead   (Rule zero: Â§2b)          â”‚
+        â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–ºâ”‚â—„â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                   â”‚
+                        â–¼                                    â”‚
+                 [implementer] â”€â”€â–º [tester] (risky changes)   â”‚
+                        â”‚               â”‚                     â”‚
+                        â–¼â—„â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                     â”‚
+                   [reviewer] â”€â”€ PASS â”€â”€â–º close bead â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                        â””â”€â”€ CHANGES REQUIRED â”€â”€â–º implementer
+
+  manual, outside the loop â€” file beads that re-enter at the top:
+  security-advisor Â· quality-check Â· dependency-auditor Â· test-gap-advisor
+  performance-advisor Â· docs-sync Â· accessibility-checker Â· requirements-check
+  modernization-advisor (report only â†’ architect)
 ```
 
-### Rules
+| Agent | Receives from | Hands to |
+|-------|---------------|----------|
+| **orchestrator** | user, `/orchestrate` | planner Â· architect Â· onboarder Â· implementer Â· tester Â· reviewer |
+| **planner** | orchestrator, `/plan-epic`, `/decompose`, `/intake-issue` | orchestrator (handoff block: ready beads + agent per bead + order) |
+| **architect** | orchestrator, planner, implementer, reviewer, `/arch`, modernization report | orchestrator (ADR + arc42 + bead list) |
+| **onboarder** | orchestrator, `aiflow init` (brownfield), `/onboard` | architect (actual structure) + everyone via memory/arc42 |
+| **implementer** | orchestrator, `/implement` | reviewer (always); tester first when risky; back to architect/planner/user when blocked |
+| **tester** | orchestrator, implementer, reviewer | reviewer; bugs back to implementer |
+| **reviewer** | orchestrator, implementer, `/review-ac` | PASS â†’ close Â· CHANGES REQUIRED â†’ implementer Â· `[suggestion]` beads |
+| **audit agents** | manual trigger only | Beads (prefixed), which re-enter via orchestrator/planner |
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+Each agent file repeats its own edges in a **"Net & handoffs"** section, so an agent started
+standalone still knows where its output goes.
 
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+**Without Claude Code** (Copilot/Codex, or a human): there is no automatic dispatch, but the route
+is the same â€” plan, check architecture fit, implement, test if risky, review, close. Walk it
+manually in that order and read the section referenced for each step.
 
-## Agent Context Profiles
+- **orchestrator** â€” entry point and dispatcher: decides which specialist handles each step, one at
+  a time, and routes the result onward. Writes routing state into the bead. Never implements.
+- **architect** â€” system design, arc42 docs, ADRs, trade-offs. Read-only-ish. Establishes Â§2b +
+  an ADR when a project still has no architecture rules ("Rule zero").
+- **planner** â€” break an epic/issue into beads with dependencies + AC, and hand the ordered set
+  back to the orchestrator with a recommended agent per bead.
+- **implementer** â€” senior engineer for one ready bead: strategy-first pre-analysis, architecture
+  fit, proven frameworks/patterns over self-built, quality gates Â§3a/Â§3b, with tests.
+- **reviewer** â€” architect **and** quality gate in one: architecture/design/risk review plus the
+  objective Â§3a checklist; verdict PASS (release) or CHANGES REQUIRED (back to implementer);
+  suggestions persisted as beads. Does not write features.
+- **tester** â€” test/QA engineer: negative/edge/boundary/exception/invalid-input tests plus test
+  QUALITY (assertions, determinism, independence). Runs when the pre-analysis flags high
+  risk/complexity, or on demand.
+- **security-advisor** â€” manually triggered (`aiflow security-check` / `/security-check`). Scans the
+  whole project and files Beads issues per finding, prioritised by severity, prefixed `[security-advisor]`.
+- **requirements-check** â€” manually triggered (`aiflow requirements-check` / `/requirements-check`).
+  Advisory only: grades issue description quality/completeness against the architecture and reports
+  gaps. Never changes issues or code.
+- **quality-check** â€” manually triggered (`aiflow quality-check` / `/quality-check`). Audits the
+  codebase for refactoring needs (dead code, now-simplifiable code, duplication, complexity) and
+  files Beads issues prefixed `[technical issue]` for the PO to triage. Read-only on code.
+- **dependency-auditor** â€” `aiflow dependency-check`. Vulns/outdated/unused/license â†’ `[dependency]` Beads.
+- **test-gap-advisor** â€” `aiflow test-gap`. Untested critical paths â†’ `[test gap]` Beads.
+- **performance-advisor** â€” `aiflow perf-check`. Perf hotspots â†’ `[performance]` Beads.
+- **docs-sync** â€” `aiflow docs-check`. Doc/code drift â†’ `[docs]` Beads.
+- **accessibility-checker** â€” `aiflow a11y-check` / `/a11y-check`. Strict WCAG 2.2 AA audit of all
+  UI surfaces â†’ `[accessibility]` Beads; recommends an automated a11y tool for the E2E suite
+  (axe-core/Pa11y/Lighthouse CI). Not part of the delivery loop.
+- **modernization-advisor** â€” `aiflow modernize-check` / `/modernize-check`. Walks the whole
+  brownfield codebase and proposes modernisation concepts (microservices, REST/cloud-native,
+  git over svn, supported stacks, missing unit/BDD/E2E test frameworks) as a **report** in
+  `.aiflow/modernization-report.md` for the architect to review â€” no code changes, no beads.
+  Not part of the delivery loop.
+- **onboarder** â€” `aiflow onboard`. Learns an existing codebase into memory + this file + arc42
+  (writes docs/memory only). Plus slash-commands `/explain <path>` and `/standup`.
 
-The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
+Customise them by editing the markdown in `.claude/agents/` (see README.md Â§8 "Customising").
+`aiflow` CLI commands (`aiflow security-check`, `aiflow quality-check`, â€¦) are agent-agnostic
+entry points â€” they work from any shell regardless of which coding agent invoked them; only the
+automatic in-session dispatch (subagents, slash-commands) is Claude Code-specific.
 
-- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
-- **Minimal**: Keep tool instruction files as pointers to `bd prime`; use the same conservative git policy unless active instructions say otherwise.
-- **Team-maintainer**: Only when the repository explicitly opts in, agents may close beads, run quality gates, commit, and push as part of session close. A current "do not commit" or "do not push" instruction still wins.
+### Skills
 
-## Session Completion
+**Skills** (`.claude/skills/<name>/SKILL.md`, Claude Code only) are a different mechanism from
+slash-commands: Claude Code matches a skill's `description` against the current task and offers
+to run it automatically, rather than waiting for an explicit `/command`.
 
-This protocol applies when ending a Beads implementation workflow. It is subordinate to explicit user, repository, and orchestrator instructions.
+**Skill or agent?** An **agent** is a *role* â€” who acts, with what authority, in what order, what
+it hands to whom. A **skill** is *knowledge* â€” a checklist or a set of trade-offs that several
+roles need (the implementer writing an endpoint and the reviewer checking it should read the same
+list). Both may exist for one topic; the same-named agent then uses the skill instead of restating
+it. Rules that must fire on **every** task â€” the Â§2 architecture rules and the Â§3a/Â§3b/Â§3c quality
+gates â€” stay inline in this file: a skill is offered by pattern match, which is the wrong mechanism
+for something that must never be missed, and Copilot/Codex get no auto-offer at all.
 
-1. **File issues for remaining work** - Create beads for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **Handle git/sync by active profile**:
-   ```bash
-   # Conservative/minimal/default: report status and proposed commands; wait for approval.
-   git status
+**Technology stacks** â€” layering, toolchain, test pyramid and the typical findings per platform:
+- **stack-embedded** â€” C/C++ firmware: HAL/driver separation, no allocation after init, ISR
+  discipline, watchdog, deterministic timing, host tests against a mocked HAL.
+- **stack-mobile** â€” Flutter/Dart, Kotlin/Android, Swift/iOS: UIâ†’presentationâ†’domainâ†data,
+  one state-management choice, process death, offline/sync, Keystore/Keychain, store constraints.
+- **stack-web-frontend** â€” Angular/React/Vue: feature slices, server state vs client state,
+  DTOâ†’view-model mapping, XSS and token handling, Core Web Vitals budgets, i18n, a11y.
+- **stack-backend** â€” Spring/Quarkus/Jakarta, .NET, Rust, Node, Go, Python: hexagonal layering with
+  ports, transaction boundaries, 12-factor config, resilience, observability, FOSS-first choices.
 
-   # Team-maintainer opt-in only, unless current instructions forbid it:
-   git pull --rebase
-   bd dolt push
-   git push
-   git status
-   ```
-5. **Hand off** - Summarize changes, validation, issue status, and any blocked sync/commit/push step
+**Integration & data architecture:**
+- **api-design** â€” REST (Â§3b) versioning, status codes, pagination, idempotency, `problem+json`,
+  OpenAPI, `.http` files; when SOAP is legitimate and how to migrate off it; GraphQL/gRPC trade-offs.
+- **messaging-events** â€” when async beats synchronous; Kafka/RabbitMQ/NATS/SQS; at-least-once +
+  idempotent consumers; transactional outbox; ordering; schema evolution; DLQs; sagas.
+- **data-storage** â€” relational default (Â§3c), when NoSQL is justified, embedded DBs, Redis as a
+  cache with real invalidation, Elasticsearch as a derived read layer, indexing and migrations.
+- **cloud-native** â€” container images, 12-factor, K8s probes/limits/rollout/secrets, EC2 immutable
+  images, modular monolith vs microservices, observability and cost.
 
-**Critical rules:**
-- Explicit user or orchestrator instructions override this Beads block.
-- Do not commit or push without clear authority from the active profile or the current user request.
-- If a required sync or push is blocked, stop and report the exact command and error.
-<!-- END BEADS INTEGRATION -->
+**Cross-cutting:**
+- **security** â€” OWASP Top 10 as a review raster + ASVS levels, IAM least privilege (roles,
+  short-lived credentials, rotation), API authN/authZ per Â§3b, secrets, crypto, supply chain
+  (pinning, scanning, never `curl | sh` unverified). The **security-advisor** uses this same raster.
+- **seo-optimization** â€” SEO for any web-facing project (HTML, GitHub Pages, static sites,
+  Next.js/Astro/Hugo/Jekyll/VuePress/VitePress/React/Vue/Svelte/Angular/â€¦): meta tags, Open
+  Graph/Twitter Cards, JSON-LD, robots.txt/sitemap.xml, canonical URLs, Core Web Vitals. Never
+  applies non-trivial changes without confirming first; ends with an SEO report.
+- **ponytail** â€” a YAGNI decision ladder (does it need to exist? already in the codebase? stdlib?
+  native platform feature? installed dependency? a one-liner? only then write it) applied before
+  any new code/dependency/abstraction, plus `/ponytail-review` to audit a diff for
+  over-engineering. Toggled by `.aiflow/config.json â†’ ponytail.enabled`/`.mode`
+  (`full`/`lite`/`ultra`, default **off**); when off the skill is present but inert.
+- **memory-setup** â€” the full memory/context-routing picture (Â§8 has the short version + toggle).
 
-<!-- BEGIN BEADS CODEX SETUP: generated by bd setup codex -->
-## Beads Issue Tracker
+Copilot/Codex have no auto-offer mechanism for any of these â€” read the relevant `SKILL.md` directly
+as a manual checklist (Codex reaches it via this file's pointer; Copilot: see the summary in
+`.github/copilot-instructions.md`). Add more by dropping a `<name>/SKILL.md` into
+`.claude/skills/`; the **description is the trigger**, so write it as "invoke when â€¦" plus the
+words that should match.
 
-Use Beads (`bd`) for durable task tracking in repositories that include it. Use the `beads` skill at `.agents/skills/beads/SKILL.md` (project install) or `~/.agents/skills/beads/SKILL.md` (global install) for Beads workflow guidance, then use the `bd` CLI for issue operations.
+**Frontmatter must be valid YAML â€” nothing warns you if it isn't.** An agent whose frontmatter
+fails to parse is **silently dropped** from the roster; a command or skill silently falls back to
+its body text as the description, so it stops matching the trigger words you wrote. The usual
+cause is an unquoted `description:` containing `": "` â€” YAML reads that as a nested mapping key.
+Quote any description containing a colon (`description: "â€¦ two hats: architect â€¦"`, single quotes
+if the text itself contains double quotes). The `pre-commit` hook checks this whenever you stage
+an agent/command/skill file, and CI enforces it on every push
+(`.github/scripts/check-frontmatter.py`). The hook needs `python3`/`python` + PyYAML; without them
+it says so and skips, so CI stays the backstop.
 
-### Quick Reference
+---
 
-```bash
-bd ready                # Find available work
-bd show <id>            # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>           # Complete work
-bd prime                # Refresh Beads context
-```
+## 6. Ralph loop (autonomous iteration â€” agent-agnostic)
 
-### Rules
+For larger tasks, run the **Ralph loop** â€” the agent iterates on the same task until it emits a
+completion (or abort) signal.
+- Headless / CI: `aiflow ralph "<prompt or bead id>" [ralph flags...]` (see
+  `.aiflow/ralph-headless.sh`). Runs on **[open-ralph-wiggum](https://github.com/Th0rgal/open-ralph-wiggum)**
+  and works with Claude Code, OpenAI Codex CLI, or GitHub Copilot CLI via `--agent
+  claude-code|codex|copilot` â€” defaults to the first agent enabled in `.aiflow/config.json â†’
+  agents.*` (claude > codex > copilot) if you don't pass `--agent` yourself. ralph-wiggum owns
+  the outer loop (iterations, restarts, `.ralph/ralph-history.json`); this script just builds the
+  task prompt. `aiflow ralph "<task>" --tasks` enables Tasks Mode for multi-part work; `ralph
+  --status` (from another terminal) shows live progress.
+- Interactive, Claude Code only: `/ralph-loop:ralph-loop` â€” a separate Claude Code plugin skill,
+  not the headless CLI above.
+- The loop stops at the AC, never invents scope. Known limitation: completion-promise
+  auto-detection isn't always reliable with every agent â€” `--max-iterations` remains the real
+  safety bound regardless.
 
-- Use `bd` for all task tracking; do not create markdown TODO lists.
-- Run `bd prime` when Beads context is missing or stale. Codex 0.129.0+ can load Beads context automatically through native hooks; use `/hooks` to inspect or toggle them.
-- Keep persistent project memory in Beads via `bd remember`; do not create ad hoc memory files.
+**Who decides whether to use it:** by default the **implementer decides automatically** from its
+**pre-analysis** (current architecture, expected change, effort, complexity): long-horizon /
+many-file / iterate-and-verify work â†’ Ralph; small crisp change â†’ direct. The decision and its
+reason are stated before implementation starts. You can also trigger it **manually**: say it in
+the Claude Code session for a given issue (`/implement <bead> ralph` / `no-ralph`, or
+`/ralph-loop`), or write it **into the bead itself** (e.g. "use the Ralph loop" in the
+description) â€” the implementer honours a directive found in the bead like an explicit flag.
+Copilot/Codex users: run `aiflow ralph "<task>" --agent codex` (or `copilot`) directly, or iterate
+on the task yourself until AC are met, checking back against Â§4 at each step.
 
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
-<!-- END BEADS CODEX SETUP -->
+---
+
+## 7. Git rules
+
+- Every project is a git repo. Commit in small, reviewable steps.
+- **Conventional Commits** + bead id: `feat(auth): add token refresh (bd-12)`. Enforced by the
+  `commit-msg` git hook.
+- The `pre-commit` hook enforces Google-style format + lint + unit tests. Do not bypass it.
+- Never commit `.env` or secrets. Never `--no-verify`. Never force-push shared branches.
+- Branch per task: `task/bd-<id>-short-slug` (unless the branching model defines a type â€” then use it).
+- **Branching model:** follow `docs/branching.md` / `.aiflow/branching.json` â€” allowed branch
+  sources, merge directions, PR rules, and release/versioning. Enforced by the `pre-push` hook
+  (git-level, works no matter which agent or human pushes); releases via `aiflow release`. Do not
+  bypass it.
+- **gitflow model â€” picking a branch type:**
+  - `feature/*`, `bugfix/*` â€” branch from `develop`, merge back to `develop`. Never target `main`.
+  - `chore/*` â€” docs-only changes and CI/workflow-file-only changes (`.github/workflows/**`)
+    count as `chore/*`, not `feature/*`, even if the diff is substantial. May target `develop`
+    or `main`. Never triggers a release.
+  - `hotfix/*` â€” for an urgent production fix only. Start with `aiflow hotfix <name>` (branches
+    off `main`, bumps `VERSION` to `X.Y.(Z+1)-HOTFIX`). Merges to `main` (triggers a patch
+    release) and is also merged into `develop` so the fix isn't lost there.
+- **`main` never carries an in-progress version.** Only `develop` carries `-SNAPSHOT` and only
+  `hotfix/*` carries `-HOTFIX`; `aiflow release` strips the suffix before it lands on `main`.
+  A pre-push guard rejects any push to `main` with a `-SNAPSHOT`/`-HOTFIX` version.
+- **Releasing is never automatic.** A release is only cut by merging `develop` â†’ `main` (minor,
+  strips `-SNAPSHOT`) or `hotfix/*` â†’ `main` (patch, strips `-HOTFIX`); `chore/*` â†’ `main`
+  never releases. Always ask the user for explicit confirmation before merging into `main` or
+  running `aiflow release --yes` â€” never decide on your own that "it's time to release." This
+  applies to every agent equally â€” Claude Code, Copilot, and Codex CLI alike.
+- End agent-authored commit messages with a trailer naming whichever agent made the commit, e.g.
+  `Co-Authored-By: Claude <noreply@anthropic.com>`, `Co-Authored-By: GitHub Copilot
+  <noreply@github.com>`, or `Co-Authored-By: OpenAI Codex <noreply@openai.com>`.
+
+---
+
+## 8. Memory (optional)
+
+Persistent project memory is **toggled by `AIFLOW_MEMORY` at the top of this file** (set by
+`aiflow init` / `aiflow change-settings`, config key `memory.enabled`; `off` by default until then).
+When **on**: store durable, non-obvious facts (decisions, gotchas, env quirks â€” never things
+already in code, git history, or Beads) in `.claude/memory/` with an index in `.claude/MEMORY.md`;
+learning intensity is `.aiflow/config.json â†’ memory.intensity` (`aggressive`/`normal`/`light`/`off`).
+Refresh graphify + cocoindex-code together with `aiflow index` after significant changes.
+
+Full detail â€” what to save, the context-routing stack (Beads vs memory files vs graphify vs
+cocoindex-code vs context7, in priority order), shared team preferences (`.aiflow/team-prefs.json`),
+and local-model (Ollama) routing â€” lives in the **memory-setup** skill
+(`.claude/skills/memory-setup/SKILL.md`, Claude Code auto-offers it; Copilot/Codex: read it
+directly, or the live routing table in `.claude/memory/memory-policy.md` once memory is on).
+
+---
+
+## 9. Communication & token budget
+
+- **Output style:** caveman by default (terse; mode in `.aiflow/config.json`) **(Claude Code
+  only)**. **Code, commits, PRs, and security warnings stay normal prose.** Toggle off with
+  `AIFLOW_CAVEMAN=off`.
+- **Keep context lean:** route via **graphify** (structure) + **cocoindex-code** (semantic RAG)
+  before reading whole files, on any agent that has them wired as MCP servers. See Â§8 +
+  `.claude/memory/memory-policy.md`.
+- **Compact regularly (`/compact`) (Claude Code only).** A full context window costs tokens on
+  *every* turn and degrades reasoning. The durable knowledge lives in Beads, `.claude/memory/`,
+  `docs/architecture/` and this file â€” the raw transcript that produced it does not. Compact:
+  - **right after `aiflow init`** on a greenfield project â€” the Q&A already wrote the aim,
+    the stack, and the architecture into config + memory; the interview transcript is dead weight;
+  - **right after the onboarder** on a brownfield project â€” likewise, everything it learned is
+    now in `.claude/memory/codebase-map.md`, AGENTS.md Â§1/Â§2 and arc42;
+  - **after every closed bead**, before picking up the next one;
+  - **before a long Ralph run** or any multi-file refactor, so the loop starts with headroom.
+
+  Before compacting, make sure what matters is persisted (bead notes/design, memory file, ADR) â€”
+  compaction is not a place to store anything. Copilot/Codex have no `/compact`: start a fresh
+  thread at the same four points, and re-read `AGENTS.md` + the bead instead.
+- **Route by difficulty:** trivial/background steps may run on cheap/local models via
+  `aiflow shell --router` **(Claude Code only)**; reserve top models for hard reasoning. Measure
+  with `aiflow cost` (Claude Code usage only).
+- **Model tiers per activity (MANDATORY).** Thinking-heavy work gets a strong model; mechanical
+  work does not. The rule is about the *activity*, not the agent's name:
+
+  | Activity | Tier | Why |
+  |----------|------|-----|
+  | Architecture, ADRs, concept work, planning/decomposition, **review**, security analysis, modernisation | **reasoning** â€” Fable 5 / Opus 5 | Wrong calls here are expensive and long-lived; they need real trade-off reasoning. |
+  | Implementation, unit tests, integration/E2E tests, refactoring, quality/a11y audits | **implementation** â€” Sonnet 5 | Bounded, well-specified work with an explicit AC to check against. |
+  | CI/CD wiring, docs drift, dependency scans, perf scans, test-gap scans, codebase mapping | **mechanical** â€” Haiku 4.5 | Pattern-matching and enumeration; no design judgement involved. |
+
+  Escalate a tier when a task turns out harder than it looked (a "simple" fix that touches the
+  architecture is architecture work) â€” never silently downgrade one.
+- **How the tiers are applied** â€” a Claude-Code-native mechanism, separate from the router above
+  (no external tool, always available). `.aiflow/config.json â†’ modelRouting.enabled` (default
+  **on**); `aiflow apply` stamps the tier's model into each subagent's frontmatter:
+  - **reasoning** â†’ `architect`, `planner`, `reviewer`, `security-advisor`, `requirements-check`,
+    `modernization-advisor`, `orchestrator`
+  - **implementation** â†’ `implementer`, `tester`, `quality-check`, `accessibility-checker`
+  - **mechanical** â†’ `docs-sync`, `test-gap-advisor`, `dependency-auditor`, `performance-advisor`,
+    `onboarder`
+
+  Override any of it in `.aiflow/config.json â†’ modelRouting.tiers` (per-tier model id) and
+  `modelRouting.agents` (per-agent tier). With `modelRouting.enabled: false` every subagent runs
+  on the session's model. Toggle via `aiflow change-settings` **(Claude Code only)**. Copilot and
+  Codex: pick the equivalent model manually per thread and keep it stable within one thread.
+- **Ponytail** â€” `.aiflow/config.json â†’ ponytail.enabled`/`.mode` (default off). When on, the
+  **ponytail** skill (Â§5) applies a YAGNI decision ladder before new code/dependencies/
+  abstractions; `/ponytail-review` audits a diff for over-engineering regardless of the toggle.
+- CLI output is filtered by **rtk** before reaching context **(Claude Code only)** â€”
+  errors/diffs are preserved.
+- **Copilot:** apply the [token-optimization guide](https://github.com/olivomarco/github-copilot-token-optimization)'s
+  techniques baked into `.github/copilot-instructions.md` â€” terse output, "landmines only"
+  context files, stable model/tool-set per thread.
+- **Codex:** when `codexsaver.enabled`, [CodexSaver](https://github.com/fendouai/CodexSaver)
+  routes cheap/bounded work (docs, tests, explanation, search) to a cheaper worker automatically
+  via MCP â€” Codex stays responsible for architecture, security, and final review.
+
+---
+
+## 10. Definition of Done (quick checklist)
+
+- [ ] Acceptance criteria met and verified
+- [ ] Â§2 architecture rules honoured â€” layering, interfaces at seams, DAO/DTO separation, reuse
+      over duplication â€” **or** the deviation was asked about *before* coding and is recorded
+- [ ] Pre-analysis done; functional decisions recorded (`/beads:decision` / `--design`)
+- [ ] Tests written/updated and passing â€” unit + BDD E2E mandatory, coverage > 80 % lines,
+      all non-static methods tested (Â§3a)
+- [ ] Static analysis clean (tool or manual pass) â€” no code smells (Â§3a)
+- [ ] Logging present with correct levels (Â§3a)
+- [ ] REST changes ship current `.http` files (Â§3b)
+- [ ] Database changes comply with Â§3c (new models per design rules; existing schemas only with
+      commission + consumer check + rollback plan; improvement potential filed as beads)
+- [ ] Google style + lint clean; Â§3a metric targets met (no new smells/duplicates, 0 warnings)
+- [ ] Review gate passed (architect review + quality-gate checklist â€” `/review-ac` on Claude
+      Code, done manually or by the user on Copilot/Codex), findings fixed, suggestions
+      persisted as `[suggestion]` beads
+- [ ] Bead updated/closed, commit references bead id
+- [ ] Docs/architecture updated if structure changed (ADR for architecture changes)
+- [ ] Queue refreshed (`aiflow next`): next task started, or the stop reason named (Â§4b)

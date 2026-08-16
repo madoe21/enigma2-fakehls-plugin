@@ -70,6 +70,12 @@
   },
   "templates_search": false,
   "meta": {
-    "aiflowVersion": "0.2.0"
+    "aiflowVersion": "0.8.0"
+  },
+  "beads": {
+    "queueMode": true
+  },
+  "modelRouting": {
+    "enabled": true
   }
 }

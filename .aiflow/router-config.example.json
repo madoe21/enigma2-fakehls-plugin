@@ -5,7 +5,7 @@
       "name": "anthropic",
       "api_base_url": "https://api.anthropic.com/v1/messages",
       "api_key": "sk-ant-REPLACE_ME",
-      "models": ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
+      "models": ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
     },
     {
       "name": "deepseek",
@@ -17,14 +17,14 @@
       "name": "ollama",
       "api_base_url": "http://localhost:11434/v1/chat/completions",
       "api_key": "ollama",
-      "models": ["qwen2.5-coder:7b"]
+      "models": ["qwen3-coder"]
     }
   ],
   "Router": {
-    "default":     "anthropic,claude-sonnet-4-6",
-    "background":  "ollama,qwen2.5-coder:7b",
-    "think":       "anthropic,claude-opus-4-8",
-    "longContext": "anthropic,claude-sonnet-4-6",
-    "webSearch":   "anthropic,claude-sonnet-4-6"
+    "default":     "anthropic,claude-sonnet-5",
+    "background":  "ollama,qwen3-coder",
+    "think":       "anthropic,claude-opus-5",
+    "longContext": "anthropic,claude-sonnet-5",
+    "webSearch":   "anthropic,claude-sonnet-5"
   }
 }

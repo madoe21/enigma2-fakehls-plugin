@@ -3,8 +3,8 @@
 # Honours the rule: on every local issue close, ASK whether to push and whether to
 # dolt-sync the configured remote (github/gitlab/custom). Never pushes silently.
 #
-# Usage:  .aiflow/bd-close-sync.sh <issue-id>
-# Agents: the CLAUDE.md §Beads-sync rule tells the agent to call this after `bd close`.
+# Usage: aiflow close-sync <issue-id>   (direct: bash .aiflow/bd-close-sync.sh <issue-id>)
+# Agents: the AGENTS.md §Beads-sync rule tells the agent to call this after `bd close`.
 set -uo pipefail
 
 ISSUE="${1:-}"

@@ -6,7 +6,7 @@
 
 Learn **aggressively**: after every non-trivial task, save durable facts (decisions, gotchas, env quirks, API shapes) to memory and refresh the graphify graph. Prefer the graph over re-reading files.
 
-## Context stack — which source to hit, in order (fewest tokens first)
+## Context stack - which source to hit, in order (fewest tokens first)
 | Need | Use | Why |
 |------|-----|-----|
 | Current task, deps, decisions, session state | **Beads** (`bd`) | structured work memory, survives compaction |
