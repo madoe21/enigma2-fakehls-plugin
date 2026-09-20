@@ -60,11 +60,10 @@ jobs:
             main)
               case "$RAW" in
                 *-*)
-                  if [ "$HEAD_REF" = develop ] || case "$HEAD_REF" in hotfix/*) true ;; *) false ;; esac; then
-                    echo "::warning::VERSION is still '$RAW' -- prepare-release strips the suffix on $HEAD_REF"
-                  else
-                    echo "::error::VERSION '$RAW' must be a clean X.Y.Z on main"; exit 1
-                  fi
+                  echo "::error::VERSION '$RAW' must be a clean X.Y.Z before it reaches main."
+                  echo "::error::Run the 'prepare-release' workflow on $HEAD_REF first:"
+                  echo "::error::  gh workflow run prepare-release.yml -f branch=$HEAD_REF"
+                  exit 1
                   ;;
               esac
               ;;
