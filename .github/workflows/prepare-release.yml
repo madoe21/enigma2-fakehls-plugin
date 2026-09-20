@@ -1,33 +1,40 @@
 name: prepare-release
 
-# A release PR (develop -> main, or hotfix/* -> main) must arrive on main with a
-# clean X.Y.Z version. main is PR-protected and Actions cannot bypass that on a
-# user-owned repo, so the suffix is stripped here, on the PR's head branch,
-# before the merge -- never on main afterwards.
+# Strips the pre-release suffix from VERSION on the release branch, BEFORE the
+# release PR into main is opened.
+#
+# Why not on the PR itself: a commit pushed with GITHUB_TOKEN may not start the
+# PR's checks -- they land as 'action_required' and the required 'verify' check
+# never completes, so the release PR stays blocked until someone approves the
+# runs by hand. Stripping first keeps the PR's head commit in place, so the
+# checks triggered when a human opens the PR are the ones that count.
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Release branch to prepare (develop, or a hotfix/* branch)"
+        required: false
+        default: develop
 
 permissions:
   contents: write
 
+# Shared with build-develop so the two can never push VERSION at the same time.
 concurrency:
-  group: prepare-release-${{ github.head_ref }}
+  group: version-${{ inputs.branch }}
   cancel-in-progress: false
 
 jobs:
   strip-suffix:
-    # chore/* PRs into main are not releases and keep their version untouched.
-    if: github.head_ref == 'develop' || startsWith(github.head_ref, 'hotfix/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
 
-      - name: Strip the pre-release suffix on the release branch
+      - name: Strip the pre-release suffix
+        id: strip
         run: |
           RAW=$(tr -d '[:space:]' < VERSION)
           CLEAN=${RAW%%-*}
@@ -35,6 +42,7 @@ jobs:
             [0-9]*.[0-9]*.[0-9]*) : ;;
             *) echo "::error::VERSION '$RAW' is not X.Y.Z[-suffix]"; exit 1 ;;
           esac
+          echo "version=$CLEAN" >> "$GITHUB_OUTPUT"
           if [ "$RAW" = "$CLEAN" ]; then
             echo "::notice::VERSION is already $CLEAN -- nothing to strip"
             exit 0
@@ -43,10 +51,29 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add VERSION
-          git commit -m "chore(release): $CLEAN [skip-bump]"
+          git commit -m "chore(release): $CLEAN [skip-bump] [skip ci]"
           for attempt in 1 2 3; do
-            git push origin "HEAD:${{ github.head_ref }}" && exit 0
+            git push origin "HEAD:${{ inputs.branch }}" && break
+            if [ "$attempt" = 3 ]; then
+              echo "::error::could not push the stripped VERSION to ${{ inputs.branch }}"
+              exit 1
+            fi
             echo "push rejected, rebasing (attempt $attempt)"
-            git pull --rebase origin "${{ github.head_ref }}"
+            git pull --rebase origin "${{ inputs.branch }}"
           done
-          echo "::error::could not push the stripped VERSION to ${{ github.head_ref }}"; exit 1
+
+      - name: Next step
+        run: |
+          V="${{ steps.strip.outputs.version }}"
+          {
+            echo "### ${{ inputs.branch }} is ready to release as \`$V\`"
+            echo
+            echo "Open the release PR **as a human** (not with \`GITHUB_TOKEN\`), so its checks run:"
+            echo
+            echo '```'
+            echo "gh pr create --repo $GITHUB_REPOSITORY --base main --head ${{ inputs.branch }} \\"
+            echo "  --title 'release: $V' --body 'Release $V'"
+            echo '```'
+            echo
+            echo "Merging it tags \`v$V\`, publishes the IPK, rebuilds the feed and bumps develop."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -10,15 +10,40 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
 
+# Shared with prepare-release so the two can never push VERSION at the same time.
 concurrency:
-  group: build-develop
+  group: version-develop
   cancel-in-progress: false
 
 jobs:
-  build:
+  gate:
     # The bump commit this job pushes must not trigger the job again.
     if: "!contains(github.event.head_commit.message, '[skip-bump]')"
+    runs-on: ubuntu-latest
+    outputs:
+      release_pr: ${{ steps.check.outputs.release_pr }}
+    steps:
+      # While a release PR is open, prepare-release owns VERSION on develop:
+      # raising the counter here would put the suffix back on a version that was
+      # just stripped for release.
+      - name: Look for an open release PR
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          N=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head develop                 --state open --json number --jq 'length')
+          if [ "$N" != 0 ]; then
+            echo "::notice::a release PR is open -- leaving VERSION alone"
+            echo "release_pr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_pr=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.release_pr == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
