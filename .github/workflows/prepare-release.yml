@@ -1,0 +1,52 @@
+name: prepare-release
+
+# A release PR (develop -> main, or hotfix/* -> main) must arrive on main with a
+# clean X.Y.Z version. main is PR-protected and Actions cannot bypass that on a
+# user-owned repo, so the suffix is stripped here, on the PR's head branch,
+# before the merge -- never on main afterwards.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prepare-release-${{ github.head_ref }}
+  cancel-in-progress: false
+
+jobs:
+  strip-suffix:
+    # chore/* PRs into main are not releases and keep their version untouched.
+    if: github.head_ref == 'develop' || startsWith(github.head_ref, 'hotfix/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Strip the pre-release suffix on the release branch
+        run: |
+          RAW=$(tr -d '[:space:]' < VERSION)
+          CLEAN=${RAW%%-*}
+          case "$CLEAN" in
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::VERSION '$RAW' is not X.Y.Z[-suffix]"; exit 1 ;;
+          esac
+          if [ "$RAW" = "$CLEAN" ]; then
+            echo "::notice::VERSION is already $CLEAN -- nothing to strip"
+            exit 0
+          fi
+          echo "$CLEAN" > VERSION
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore(release): $CLEAN [skip-bump]"
+          for attempt in 1 2 3; do
+            git push origin "HEAD:${{ github.head_ref }}" && exit 0
+            echo "push rejected, rebasing (attempt $attempt)"
+            git pull --rebase origin "${{ github.head_ref }}"
+          done
+          echo "::error::could not push the stripped VERSION to ${{ github.head_ref }}"; exit 1

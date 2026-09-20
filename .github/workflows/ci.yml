@@ -2,66 +2,70 @@ name: ci
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
 
 jobs:
-  # Linux runner exercises the real-FIFO segmenter paths (mkfifo, O_NONBLOCK,
-  # EOF semantics) that are untestable on the Windows dev machine.
-  python-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with: { python-version: "3.12" }
-      - run: pip install pytest
-      - run: python -m pytest tests/ -q
-
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      # Auto-detect stack and run style + tests. Extend per project.
-      - name: Node
-        if: hashFiles('package.json') != ''
-        uses: actions/setup-node@v6
-        with: { node-version: "22" }
-      - name: Node verify
-        if: hashFiles('package.json') != ''
-        run: |
-          npm ci || npm install
-          npx --yes prettier --check . || echo "::warning::prettier issues"
-          npm test --if-present
-
-      - name: Python
-        if: hashFiles('pyproject.toml','requirements.txt') != ''
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
-      - name: Python verify
-        if: hashFiles('pyproject.toml','requirements.txt') != ''
-        run: |
-          pip install black isort pytest || true
-          black --check . || echo "::warning::black issues"
-          isort --check-only . || echo "::warning::isort issues"
-          pytest -q || echo "no tests"
 
-      - name: Go
-        if: hashFiles('go.mod') != ''
-        uses: actions/setup-go@v6
-        with: { go-version: "stable" }
-      - name: Go verify
-        if: hashFiles('go.mod') != ''
-        run: |
-          test -z "$(gofmt -l .)" || { echo "::error::gofmt"; gofmt -l .; exit 1; }
-          go test ./... || echo "no tests"
+      - name: Byte-compile plugin sources
+        run: python -m compileall -q src
 
-      - name: Dart/Flutter
-        if: hashFiles('pubspec.yaml') != ''
-        uses: subosito/flutter-action@v2
-      - name: Dart verify
-        if: hashFiles('pubspec.yaml') != ''
+      - name: Shell syntax check
         run: |
-          dart format --output=none --set-exit-if-changed . || echo "::warning::dart format"
-          flutter analyze || dart analyze || true
-          flutter test || dart test || echo "no tests"
+          for f in $(git ls-files 'tests/*.sh' 'src/init.d/*' 'control/postinst' 'control/prerm'); do
+            echo "sh -n $f"
+            sh -n "$f"
+          done
+
+      - name: Unit tests
+        # The 'test' target only exists once a branch ships tests.
+        run: |
+          if make -n test >/dev/null 2>&1; then
+            make test
+          else
+            echo "::notice::no 'make test' target on this branch"
+          fi
+
+      - name: Build IPK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext fakeroot binutils
+          make ipk
+          ls -l build/*.ipk
+
+      - name: Check VERSION suffix matches branch
+        # develop carries the rolling build counter, main never carries a suffix.
+        # A main -> develop back-merge legitimately carries the clean release
+        # version, so it is exempt from the develop rule.
+        if: github.head_ref != 'main'
+        run: |
+          RAW=$(tr -d '[:space:]' < VERSION)
+          BASE_REF="${{ github.base_ref || github.ref_name }}"
+          HEAD_REF="${{ github.head_ref }}"
+          echo "VERSION=$RAW base=$BASE_REF head=$HEAD_REF"
+          case "$BASE_REF" in
+            develop)
+              case "$RAW" in
+                *-build[0-9]*) : ;;
+                *) echo "::error::VERSION '$RAW' on develop must look like X.Y.Z-buildN"; exit 1 ;;
+              esac
+              ;;
+            main)
+              case "$RAW" in
+                *-*)
+                  if [ "$HEAD_REF" = develop ] || case "$HEAD_REF" in hotfix/*) true ;; *) false ;; esac; then
+                    echo "::warning::VERSION is still '$RAW' -- prepare-release strips the suffix on $HEAD_REF"
+                  else
+                    echo "::error::VERSION '$RAW' must be a clean X.Y.Z on main"; exit 1
+                  fi
+                  ;;
+              esac
+              ;;
+          esac

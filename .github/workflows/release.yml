@@ -1,4 +1,9 @@
 name: release
+
+# A release is cut by merging develop (or a hotfix) into main. The version that
+# lands on main is already clean -- prepare-release.yml strips the -buildN /
+# -HOTFIX suffix on the release branch while the PR is open. This workflow tags,
+# builds, publishes, rebuilds the feed and opens the next build cycle on develop.
 on:
   push:
     branches: [main]
@@ -8,45 +13,64 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.check.outputs.released }}
+      version: ${{ steps.ver.outputs.version }}
+      package: ${{ steps.ver.outputs.package }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: main
           fetch-depth: 0
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gettext fakeroot binutils
 
       - name: Read version
         id: ver
         run: |
-          V=$(cat VERSION | tr -d '[:space:]')
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          RAW=$(tr -d '[:space:]' < VERSION)
+          case "$RAW" in
+            *-*)
+              echo "::error::VERSION on main is '$RAW'. main must never carry a pre-release"
+              echo "::error::suffix -- the prepare-release workflow strips it on the release"
+              echo "::error::branch before the merge (or run 'aiflow release --yes')."
+              exit 1
+              ;;
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::VERSION '$RAW' is not X.Y.Z"; exit 1 ;;
+          esac
+          PKG=$(awk '/^Package:/{print $2;exit}' control/control)
+          test -n "$PKG"
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$RAW" >> "$GITHUB_OUTPUT"
+          echo "package=$PKG" >> "$GITHUB_OUTPUT"
 
       - name: Skip if this version is already released
         id: check
         run: |
           if git rev-parse -q --verify "refs/tags/${{ steps.ver.outputs.tag }}" >/dev/null; then
-            echo "exists=true"  >> "$GITHUB_OUTPUT"
-            echo "::notice::Tag ${{ steps.ver.outputs.tag }} already exists — nothing to release."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tag ${{ steps.ver.outputs.tag }} already exists -- nothing to release."
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "released=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install build dependencies
+        if: steps.check.outputs.released == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext fakeroot binutils
+
       - name: Build IPK
-        if: steps.check.outputs.exists == 'false'
+        if: steps.check.outputs.released == 'true'
         run: make ipk
 
       - name: Locate IPK artifact
-        if: steps.check.outputs.exists == 'false'
+        if: steps.check.outputs.released == 'true'
         id: ipk
         run: |
           FILE=$(ls build/*.ipk | head -n1)
@@ -54,7 +78,7 @@ jobs:
           echo "path=$FILE" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
-        if: steps.check.outputs.exists == 'false'
+        if: steps.check.outputs.released == 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -62,7 +86,7 @@ jobs:
           git push origin "${{ steps.ver.outputs.tag }}"
 
       - name: Publish GitHub Release
-        if: steps.check.outputs.exists == 'false'
+        if: steps.check.outputs.released == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
@@ -70,14 +94,71 @@ jobs:
           files: ${{ steps.ipk.outputs.path }}
           generate_release_notes: true
 
+  feed:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
       - name: Trigger feed rebuild
-        if: steps.check.outputs.exists == 'false' && env.FEED_DISPATCH_TOKEN != ''
         env:
           FEED_DISPATCH_TOKEN: ${{ secrets.FEED_DISPATCH_TOKEN }}
         run: |
-          curl -sS -X POST \
+          if [ -z "${FEED_DISPATCH_TOKEN:-}" ]; then
+            echo "::error::FEED_DISPATCH_TOKEN is not set -- the feed was NOT rebuilt"
+            exit 1
+          fi
+          curl -fsS -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $FEED_DISPATCH_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/madoe21/enigma2-madoe21-feed/dispatches" \
-            -d '{"event_type":"plugin-released","client_payload":{"repo":"${{ github.repository }}","tag":"${{ steps.ver.outputs.tag }}"}}'
+            -d '{"event_type":"plugin-released","client_payload":{"repo":"${{ github.repository }}","tag":"v${{ needs.release.outputs.version }}"}}'
+          echo "::notice::feed rebuild dispatched for v${{ needs.release.outputs.version }}"
+
+      - name: Wait for the feed to serve this version
+        run: |
+          URL=https://madoe21.github.io/enigma2-madoe21-feed/feed/Packages
+          WANT="${{ needs.release.outputs.version }}"
+          PKG="${{ needs.release.outputs.package }}"
+          for i in $(seq 1 30); do
+            sleep 20
+            if curl -fsS "$URL" \
+                 | awk -v pkg="$PKG" '$0=="Package: "pkg{f=1;next} f&&/^Version:/{print $2;exit}' \
+                 | grep -qx "$WANT"; then
+              echo "::notice::feed serves $PKG $WANT"
+              exit 0
+            fi
+            echo "attempt $i: feed not on $PKG $WANT yet"
+          done
+          echo "::warning::feed did not serve $PKG $WANT within 10 minutes -- check the build-feed run"
+
+  bump-develop:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Open the next build cycle on develop
+        run: |
+          IFS=. read MA MI PA <<<"${{ needs.release.outputs.version }}"
+          NEXT="${MA}.$((MI + 1)).0-build1"
+          CUR=$(tr -d '[:space:]' < VERSION)
+          if [ "$CUR" = "$NEXT" ]; then
+            echo "::notice::develop already on $NEXT"
+            exit 0
+          fi
+          echo "$NEXT" > VERSION
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore(version): $NEXT [skip-bump] [skip ci]"
+          for attempt in 1 2 3; do
+            git push origin HEAD:develop && exit 0
+            echo "push rejected, rebasing on develop (attempt $attempt)"
+            git pull --rebase origin develop
+          done
+          echo "::error::could not push the post-release bump to develop"; exit 1
