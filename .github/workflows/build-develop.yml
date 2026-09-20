@@ -1,0 +1,77 @@
+name: build-develop
+
+# Every push to develop produces a build: the -buildN counter in VERSION is
+# raised, the IPK is built with that exact version and kept as an artifact.
+# Nothing here publishes a release or touches the feed -- only main does that.
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-develop
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # The bump commit this job pushes must not trigger the job again.
+    if: "!contains(github.event.head_commit.message, '[skip-bump]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Raise build counter
+        id: ver
+        run: |
+          RAW=$(tr -d '[:space:]' < VERSION)
+          BASE=${RAW%%-*}
+          case "$BASE" in
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::VERSION '$RAW' is not X.Y.Z[-suffix]"; exit 1 ;;
+          esac
+          case "$RAW" in
+            *-build*) N=${RAW##*-build} ;;
+            *)        N=0 ;;
+          esac
+          case "$N" in
+            ''|*[!0-9]*) N=0 ;;
+          esac
+          NEXT="${BASE}-build$((N + 1))"
+          echo "$NEXT" > VERSION
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "::notice::develop build version $NEXT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext fakeroot binutils
+
+      - name: Build IPK
+        run: make ipk
+
+      - name: Upload IPK artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ipk-${{ steps.ver.outputs.version }}
+          path: build/*.ipk
+          retention-days: 14
+
+      # Only a green build gets its version recorded on develop.
+      - name: Commit VERSION
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore(version): ${{ steps.ver.outputs.version }} [skip-bump] [skip ci]"
+          for attempt in 1 2 3; do
+            git push origin HEAD:develop && exit 0
+            echo "push rejected, rebasing on develop (attempt $attempt)"
+            git pull --rebase origin develop
+          done
+          echo "::error::could not push the VERSION bump to develop"; exit 1
